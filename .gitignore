@@ -1,0 +1,13 @@
+/target/
+/.idea/
+/.vscode/
+/.DS_Store
+**/.DS_Store
+.playwright-cli/
+output/
+*.log
+*.pid
+*.swp
+*.swo
+*.tmp
+*.bak

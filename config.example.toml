@@ -1,0 +1,27 @@
+[server]
+listen = "127.0.0.1:8787"
+
+[telegram]
+bot_token = "123456:replace-me"
+allowed_user_ids = [123456789]
+public_base_url = "https://example.com"
+webhook_secret = "replace-with-random-secret"
+api_base_url = "https://api.telegram.org"
+
+[codex]
+connect_url = "ws://127.0.0.1:4222"
+listen_url = "ws://127.0.0.1:4222"
+reuse_existing_server = true
+working_directory = "."
+model = "gpt-5-codex"
+additional_directories = [
+  "../openfang",
+  "../../git/codex",
+]
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+skip_git_repo_check = true
+network_access_enabled = true
+web_search_enabled = true
+orchestrator_name = "codexclaw-orchestrator"
+
