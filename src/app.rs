@@ -92,6 +92,18 @@ async fn process_telegram_update(
     update: TelegramUpdate,
     inbound: crate::telegram::InboundMessage,
 ) -> Result<()> {
+    if inbound.requests_new_chat() {
+        runner.reset_chat(&inbound).await?;
+        send_markdown_message(
+            config,
+            inbound.chat_id,
+            inbound.thread_id,
+            "Started a fresh chat. History cleared for this Telegram chat.",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let attachment = match download_attachment(config, &inbound, &config.attachment_root()).await {
         Ok(attachment) => attachment,
         Err(error) => {
@@ -248,6 +260,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChatTurnRunner for FakeTurnRunner {
+        async fn reset_chat(&self, _inbound: &InboundMessage) -> Result<()> {
+            Ok(())
+        }
+
         async fn run_chat_turn(
             &self,
             _inbound: InboundMessage,
@@ -300,6 +316,66 @@ mod tests {
                 .any(|text| text.contains("Second intermediate"))
         );
         assert!(messages.iter().any(|text| text.contains("Final answer")));
+
+        let reply_markup = requests
+            .iter()
+            .find(|request| request.path.ends_with("/sendMessage"))
+            .and_then(|request| serde_json::from_slice::<Value>(&request.body).ok())
+            .and_then(|value| value.get("reply_markup").cloned())
+            .expect("reply_markup");
+        assert_eq!(reply_markup["keyboard"][0][0]["text"], "New");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_resets_chat_on_new_command() -> Result<()> {
+        #[derive(Default)]
+        struct ResettableRunner {
+            resets: Arc<Mutex<Vec<i64>>>,
+            turns: Arc<Mutex<u32>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ChatTurnRunner for ResettableRunner {
+            async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()> {
+                self.resets.lock().await.push(inbound.chat_id);
+                Ok(())
+            }
+
+            async fn run_chat_turn(
+                &self,
+                _inbound: InboundMessage,
+                _attachment: Option<DownloadedAttachment>,
+                _sink: &mut dyn OutputSink,
+            ) -> Result<()> {
+                *self.turns.lock().await += 1;
+                Ok(())
+            }
+        }
+
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let update = sample_update_with_text("New");
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        let runner = ResettableRunner::default();
+
+        process_telegram_update(&runner, &config, update, inbound).await?;
+
+        assert_eq!(runner.resets.lock().await.as_slice(), &[100]);
+        assert_eq!(*runner.turns.lock().await, 0);
+
+        let requests = mock.requests().await;
+        let messages: Vec<String> = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/sendMessage"))
+            .map(|request| {
+                let value: Value = serde_json::from_slice(&request.body).expect("sendMessage json");
+                value["text"].as_str().unwrap_or_default().to_string()
+            })
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("fresh chat"));
         Ok(())
     }
 

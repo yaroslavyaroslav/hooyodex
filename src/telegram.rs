@@ -10,6 +10,8 @@ use tokio::fs;
 use crate::config::AppConfig;
 use crate::markdown::{markdown_to_telegram_html, sanitize_telegram_html, split_telegram_message};
 
+pub const NEW_CHAT_BUTTON_TEXT: &str = "New";
+
 #[derive(Debug, Deserialize)]
 pub struct TelegramUpdate {
     pub update_id: i64,
@@ -91,6 +93,25 @@ pub enum DownloadedAttachment {
         path: PathBuf,
         duration_seconds: Option<u32>,
     },
+}
+
+impl InboundMessage {
+    pub fn requests_new_chat(&self) -> bool {
+        matches!(
+            self.text.as_deref().map(str::trim),
+            Some(text)
+                if text.eq_ignore_ascii_case(NEW_CHAT_BUTTON_TEXT)
+                    || text.eq_ignore_ascii_case("/new")
+        )
+    }
+}
+
+fn new_chat_reply_markup() -> serde_json::Value {
+    json!({
+        "keyboard": [[{ "text": NEW_CHAT_BUTTON_TEXT }]],
+        "resize_keyboard": true,
+        "is_persistent": true,
+    })
 }
 
 pub fn normalize_update(update: &TelegramUpdate, allowed_users: &[i64]) -> Option<InboundMessage> {
@@ -222,6 +243,7 @@ pub async fn send_markdown_message(
             "chat_id": chat_id,
             "text": chunk,
             "parse_mode": "HTML",
+            "reply_markup": new_chat_reply_markup(),
         });
         if let Some(thread_id) = thread_id {
             body["message_thread_id"] = json!(thread_id);
@@ -265,7 +287,8 @@ pub async fn send_photo(
 
     let mut form = Form::new()
         .text("chat_id", chat_id.to_string())
-        .part("photo", photo);
+        .part("photo", photo)
+        .text("reply_markup", new_chat_reply_markup().to_string());
     if let Some(thread_id) = thread_id {
         form = form.text("message_thread_id", thread_id.to_string());
     }
@@ -456,5 +479,45 @@ mod tests {
             Some("image/jpeg")
         );
         assert_eq!(image_mime_type(Path::new("/tmp/file.bin")), None);
+    }
+
+    #[test]
+    fn detects_new_chat_button_and_command() {
+        let inbound = normalize_update(
+            &TelegramUpdate {
+                update_id: 1,
+                message: Some(sample_message()),
+                edited_message: None,
+            },
+            &[42],
+        )
+        .expect("inbound");
+        assert!(!inbound.requests_new_chat());
+
+        let mut button_message = sample_message();
+        button_message.text = Some("New".to_string());
+        let button_inbound = normalize_update(
+            &TelegramUpdate {
+                update_id: 2,
+                message: Some(button_message),
+                edited_message: None,
+            },
+            &[42],
+        )
+        .expect("button inbound");
+        assert!(button_inbound.requests_new_chat());
+
+        let mut command_message = sample_message();
+        command_message.text = Some("/new".to_string());
+        let command_inbound = normalize_update(
+            &TelegramUpdate {
+                update_id: 3,
+                message: Some(command_message),
+                edited_message: None,
+            },
+            &[42],
+        )
+        .expect("command inbound");
+        assert!(command_inbound.requests_new_chat());
     }
 }

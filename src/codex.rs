@@ -50,6 +50,8 @@ pub trait OutputSink: Send {
 
 #[async_trait]
 pub trait ChatTurnRunner: Send + Sync {
+    async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()>;
+
     async fn run_chat_turn(
         &self,
         inbound: InboundMessage,
@@ -274,6 +276,27 @@ impl SessionManager {
         Ok(())
     }
 
+    pub async fn reset_chat_thread(&self, inbound: &InboundMessage) -> Result<()> {
+        let key = inbound.chat_id.to_string();
+        let session = Arc::new(Mutex::new(self.runtime.codex.start_thread(
+            self.base_thread_options(),
+        )));
+        let mut thread = session.lock().await;
+        let _ = prepare_live_thread(&mut *thread).await?;
+        let thread_id = thread
+            .id()
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow!("thread id unavailable after reset"))?;
+        drop(thread);
+
+        self.chats.lock().await.insert(key.clone(), session);
+
+        let mut state = self.state.lock().await;
+        state.chat_threads.insert(key, thread_id);
+        state.save(&self.sessions_path)?;
+        Ok(())
+    }
+
     async fn get_or_create_chat_thread(&self, key: &str) -> Result<Arc<Mutex<Thread>>> {
         if let Some(existing) = self.chats.lock().await.get(key).cloned() {
             return Ok(existing);
@@ -443,6 +466,10 @@ impl SessionManager {
 
 #[async_trait]
 impl ChatTurnRunner for SessionManager {
+    async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()> {
+        self.reset_chat_thread(inbound).await
+    }
+
     async fn run_chat_turn(
         &self,
         inbound: InboundMessage,
