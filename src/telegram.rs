@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
+use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::fs;
@@ -234,6 +235,54 @@ pub async fn send_markdown_message(
     Ok(())
 }
 
+pub async fn send_photo(
+    config: &AppConfig,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    path: &Path,
+    caption_html: Option<&str>,
+) -> Result<()> {
+    let client = Client::new();
+    let url = format!(
+        "{}/bot{}/sendPhoto",
+        config.telegram.api_base_url.trim_end_matches('/'),
+        config.telegram.bot_token
+    );
+
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("failed to read image {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image.png")
+        .to_string();
+
+    let mut photo = Part::bytes(bytes).file_name(file_name);
+    if let Some(mime) = image_mime_type(path) {
+        photo = photo.mime_str(mime)?;
+    }
+
+    let mut form = Form::new()
+        .text("chat_id", chat_id.to_string())
+        .part("photo", photo);
+    if let Some(thread_id) = thread_id {
+        form = form.text("message_thread_id", thread_id.to_string());
+    }
+    if let Some(caption_html) = caption_html.filter(|caption| !caption.trim().is_empty()) {
+        form = form
+            .text("caption", sanitize_telegram_html(caption_html))
+            .text("parse_mode", "HTML");
+    }
+
+    let response = client.post(&url).multipart(form).send().await?;
+    if !response.status().is_success() {
+        let text = response.text().await.unwrap_or_default();
+        bail!("Telegram sendPhoto failed: {}", text);
+    }
+    Ok(())
+}
+
 pub async fn download_attachment(
     config: &AppConfig,
     inbound: &InboundMessage,
@@ -333,6 +382,15 @@ async fn download_file(
     Ok(full_path)
 }
 
+fn image_mime_type(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +443,18 @@ mod tests {
         let inbound = normalize_update(&update, &[42]).expect("inbound");
         assert_eq!(inbound.document_file_id.as_deref(), Some("doc-1"));
         assert_eq!(inbound.document_name.as_deref(), Some("note.txt"));
+    }
+
+    #[test]
+    fn detects_common_image_mime_types() {
+        assert_eq!(
+            image_mime_type(Path::new("/tmp/file.png")),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_mime_type(Path::new("/tmp/file.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(image_mime_type(Path::new("/tmp/file.bin")), None);
     }
 }

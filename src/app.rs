@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
+use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -11,16 +11,16 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use crate::codex::SessionManager;
+use crate::codex::{ChatTurnRunner, OutputSink, SessionManager, TurnOutput};
 use crate::config::AppConfig;
 use crate::telegram::{
-    TelegramUpdate, download_attachment, normalize_update, send_markdown_message,
+    TelegramUpdate, download_attachment, normalize_update, send_markdown_message, send_photo,
 };
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<RwLock<AppConfig>>,
-    sessions: Arc<SessionManager>,
+    sessions: Arc<dyn ChatTurnRunner>,
 }
 
 pub async fn run(config: AppConfig) -> Result<()> {
@@ -62,7 +62,7 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn telegram_webhook(
     State(state): State<AppState>,
-    Path(secret): Path<String>,
+    AxumPath(secret): AxumPath<String>,
     Json(update): Json<TelegramUpdate>,
 ) -> StatusCode {
     let config = state.config.read().await.clone();
@@ -74,66 +74,87 @@ async fn telegram_webhook(
         return StatusCode::OK;
     };
 
+    let sessions = state.sessions.clone();
     tokio::spawn(async move {
-        let attachment =
-            match download_attachment(&config, &inbound, &config.attachment_root()).await {
-                Ok(attachment) => attachment,
-                Err(error) => {
-                    error!(
-                        chat_id = inbound.chat_id,
-                        sender_id = inbound.sender_id,
-                        update_id = update.update_id,
-                        "failed to download Telegram attachment: {error}"
-                    );
-                    let _ = send_markdown_message(
-                        &config,
-                        inbound.chat_id,
-                        inbound.thread_id,
-                        &format!("Attachment download failed:\n\n```text\n{error}\n```"),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-        match state
-            .sessions
-            .run_chat_turn(inbound.clone(), attachment)
-            .await
+        if let Err(error) =
+            process_telegram_update(sessions.as_ref(), &config, update, inbound).await
         {
-            Ok(output) => {
-                for message in output.markdown_messages {
-                    if let Err(error) =
-                        send_markdown_message(&config, inbound.chat_id, inbound.thread_id, &message)
-                            .await
-                    {
-                        error!(
-                            chat_id = inbound.chat_id,
-                            message_id = inbound.message_id,
-                            "failed to send Telegram response: {error}"
-                        );
-                        break;
-                    }
-                }
-            }
-            Err(error) => {
-                error!(
-                    chat_id = inbound.chat_id,
-                    message_id = inbound.message_id,
-                    "Codex turn failed: {error}"
-                );
-                let _ = send_markdown_message(
-                    &config,
-                    inbound.chat_id,
-                    inbound.thread_id,
-                    &format!("Turn failed:\n\n```text\n{error}\n```"),
-                )
-                .await;
-            }
+            error!("failed to process Telegram update: {error}");
         }
     });
 
     StatusCode::OK
+}
+
+async fn process_telegram_update(
+    runner: &dyn ChatTurnRunner,
+    config: &AppConfig,
+    update: TelegramUpdate,
+    inbound: crate::telegram::InboundMessage,
+) -> Result<()> {
+    let attachment = match download_attachment(config, &inbound, &config.attachment_root()).await {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            error!(
+                chat_id = inbound.chat_id,
+                sender_id = inbound.sender_id,
+                update_id = update.update_id,
+                "failed to download Telegram attachment: {error}"
+            );
+            let _ = send_markdown_message(
+                config,
+                inbound.chat_id,
+                inbound.thread_id,
+                &format!("Attachment download failed:\n\n```text\n{error}\n```"),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    let chat_id = inbound.chat_id;
+    let thread_id = inbound.thread_id;
+    let message_id = inbound.message_id;
+    let mut sink = TelegramSink {
+        config: config.clone(),
+        chat_id,
+        thread_id,
+    };
+
+    match runner.run_chat_turn(inbound, attachment, &mut sink).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            error!(chat_id, message_id, "Codex turn failed: {error}");
+            let _ = send_markdown_message(
+                config,
+                chat_id,
+                thread_id,
+                &format!("Turn failed:\n\n```text\n{error}\n```"),
+            )
+            .await;
+            Ok(())
+        }
+    }
+}
+
+struct TelegramSink {
+    config: AppConfig,
+    chat_id: i64,
+    thread_id: Option<i64>,
+}
+
+#[async_trait::async_trait]
+impl OutputSink for TelegramSink {
+    async fn send(&mut self, output: TurnOutput) -> Result<()> {
+        match output {
+            TurnOutput::Markdown(markdown) => {
+                send_markdown_message(&self.config, self.chat_id, self.thread_id, &markdown).await
+            }
+            TurnOutput::Image(path) => {
+                send_photo(&self.config, self.chat_id, self.thread_id, &path, None).await
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -185,4 +206,283 @@ fn spawn_reload_task(config: Arc<RwLock<AppConfig>>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::routing::{get, post};
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    use crate::codex::TurnOutput;
+    use crate::config::{AppConfig, AppPaths, CodexConfig, ServerConfig, TelegramConfig};
+    use crate::telegram::{
+        DownloadedAttachment, InboundMessage, TelegramChat, TelegramMessage, TelegramUpdate,
+        TelegramUser, normalize_update,
+    };
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        path: String,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockTelegramState {
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    }
+
+    struct FakeTurnRunner {
+        scripted_outputs: Vec<TurnOutput>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatTurnRunner for FakeTurnRunner {
+        async fn run_chat_turn(
+            &self,
+            _inbound: InboundMessage,
+            _attachment: Option<DownloadedAttachment>,
+            sink: &mut dyn OutputSink,
+        ) -> Result<()> {
+            for output in self.scripted_outputs.clone() {
+                sink.send(output).await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn process_update_sends_each_markdown_chunk_to_telegram() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let update = sample_update();
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        let runner = FakeTurnRunner {
+            scripted_outputs: vec![
+                TurnOutput::Markdown("First intermediate".to_string()),
+                TurnOutput::Markdown("Second intermediate".to_string()),
+                TurnOutput::Markdown("Final answer".to_string()),
+            ],
+        };
+
+        process_telegram_update(&runner, &config, update, inbound).await?;
+
+        let requests = mock.requests().await;
+        let messages: Vec<String> = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/sendMessage"))
+            .map(|request| {
+                let value: Value = serde_json::from_slice(&request.body).expect("sendMessage json");
+                value["text"].as_str().unwrap_or_default().to_string()
+            })
+            .collect();
+
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("First intermediate"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("Second intermediate"))
+        );
+        assert!(messages.iter().any(|text| text.contains("Final answer")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Codex auth/network; run manually"]
+    async fn e2e_live_codex_streams_intermediate_messages_to_mock_telegram() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = live_e2e_config(tempdir.path(), &mock.base_url)?;
+        let sessions = SessionManager::new(config.clone()).await?;
+        sessions.ensure_orchestrator().await?;
+
+        let update = sample_update_with_text(
+            "Before the final answer, send two short intermediary user-visible updates exactly `STEP_ONE` and `STEP_TWO` in separate messages while you think. Then send final answer exactly `DONE`.",
+        );
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+
+        process_telegram_update(&sessions, &config, update, inbound).await?;
+
+        let requests = mock.requests().await;
+        let messages: Vec<String> = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/sendMessage"))
+            .map(|request| {
+                let value: Value = serde_json::from_slice(&request.body).expect("sendMessage json");
+                value["text"].as_str().unwrap_or_default().to_string()
+            })
+            .collect();
+
+        let transcript = messages.join("\n---\n");
+        assert!(
+            messages.iter().any(|message| message.contains("STEP_ONE")),
+            "expected a streamed Telegram message containing STEP_ONE, got:\n{transcript}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("STEP_TWO")),
+            "expected a streamed Telegram message containing STEP_TWO, got:\n{transcript}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("DONE")),
+            "expected a final Telegram message containing DONE, got:\n{transcript}"
+        );
+        assert!(
+            messages.len() >= 3,
+            "expected at least three Telegram messages (2 intermediate + final), got:\n{transcript}"
+        );
+        Ok(())
+    }
+
+    fn test_config(working_directory: &std::path::Path, api_base_url: &str) -> AppConfig {
+        AppConfig {
+            paths: AppPaths {
+                config_path: working_directory.join("config.toml"),
+                state_dir: working_directory.join("state"),
+                cache_dir: working_directory.join("cache"),
+            },
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+            },
+            telegram: TelegramConfig {
+                bot_token: "token".to_string(),
+                allowed_user_ids: vec![42],
+                public_base_url: "https://example.com".to_string(),
+                webhook_secret: "secret".to_string(),
+                api_base_url: api_base_url.to_string(),
+            },
+            codex: CodexConfig {
+                connect_url: "ws://127.0.0.1:4222".to_string(),
+                listen_url: "ws://127.0.0.1:4222".to_string(),
+                reuse_existing_server: true,
+                working_directory: working_directory.to_path_buf(),
+                model: None,
+                additional_directories: Vec::new(),
+                approval_policy: "never".to_string(),
+                sandbox_mode: "danger-full-access".to_string(),
+                skip_git_repo_check: true,
+                network_access_enabled: true,
+                web_search_enabled: true,
+                orchestrator_name: None,
+            },
+        }
+    }
+
+    fn live_e2e_config(temp_root: &std::path::Path, api_base_url: &str) -> Result<AppConfig> {
+        let config_path = std::env::var("CODEXCLAW_E2E_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join("codexclaw")
+                    .join("config.toml")
+            });
+
+        let mut config = AppConfig::load(Some(config_path.clone()))?;
+        config.paths = AppPaths {
+            config_path,
+            state_dir: temp_root.join("state"),
+            cache_dir: temp_root.join("cache"),
+        };
+        std::fs::create_dir_all(&config.paths.state_dir)?;
+        std::fs::create_dir_all(&config.paths.cache_dir)?;
+        config.telegram.api_base_url = api_base_url.to_string();
+        config.telegram.allowed_user_ids = vec![42];
+        config.telegram.bot_token = "token".to_string();
+        config.telegram.public_base_url = "https://example.com".to_string();
+        config.telegram.webhook_secret = "secret".to_string();
+        config.codex.model = Some("gpt-5.4-mini".to_string());
+        Ok(config)
+    }
+
+    fn sample_update() -> TelegramUpdate {
+        sample_update_with_text("hello")
+    }
+
+    fn sample_update_with_text(text: &str) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id: 1,
+            message: Some(TelegramMessage {
+                message_id: 10,
+                chat: TelegramChat {
+                    id: 100,
+                    kind: "private".to_string(),
+                },
+                from: Some(TelegramUser {
+                    id: 42,
+                    first_name: Some("Test".to_string()),
+                    last_name: None,
+                }),
+                sender_chat: None,
+                text: Some(text.to_string()),
+                caption: None,
+                photo: None,
+                document: None,
+                voice: None,
+                message_thread_id: None,
+            }),
+            edited_message: None,
+        }
+    }
+
+    struct MockTelegramApi {
+        base_url: String,
+        state: MockTelegramState,
+    }
+
+    impl MockTelegramApi {
+        async fn requests(&self) -> Vec<RecordedRequest> {
+            self.state.requests.lock().await.clone()
+        }
+    }
+
+    async fn start_mock_telegram_api() -> Result<MockTelegramApi> {
+        async fn record_request(
+            State(state): State<MockTelegramState>,
+            uri: axum::http::Uri,
+            body: Bytes,
+        ) -> Json<Value> {
+            state.requests.lock().await.push(RecordedRequest {
+                path: uri.path().to_string(),
+                body: body.to_vec(),
+            });
+            Json(json!({ "ok": true, "result": {} }))
+        }
+
+        async fn file_response() -> &'static [u8] {
+            b"file"
+        }
+
+        let state = MockTelegramState::default();
+        let app = Router::new()
+            .route("/{*path}", post(record_request))
+            .route("/file/{*path}", get(file_response))
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Ok(MockTelegramApi {
+            base_url: format!("http://{}", address),
+            state,
+        })
+    }
 }
