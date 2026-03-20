@@ -10,9 +10,7 @@ use codex_app_server_sdk::api::{
     ThreadItem, ThreadOptions, TurnOptions, UserInput, WebSearchMode,
 };
 use codex_app_server_sdk::events::{ServerEvent, ServerNotification};
-use codex_app_server_sdk::protocol::notifications::{
-    DeltaNotification, ItemLifecycleNotification,
-};
+use codex_app_server_sdk::protocol::notifications::{DeltaNotification, ItemLifecycleNotification};
 use codex_app_server_sdk::protocol::requests;
 use codex_app_server_sdk::{WsConfig, WsServerHandle, WsStartConfig};
 use serde_json::{Map, Value};
@@ -278,9 +276,9 @@ impl SessionManager {
 
     pub async fn reset_chat_thread(&self, inbound: &InboundMessage) -> Result<()> {
         let key = inbound.chat_id.to_string();
-        let session = Arc::new(Mutex::new(self.runtime.codex.start_thread(
-            self.base_thread_options(),
-        )));
+        let session = Arc::new(Mutex::new(
+            self.runtime.codex.start_thread(self.base_thread_options()),
+        ));
         let mut thread = session.lock().await;
         let _ = prepare_live_thread(&mut *thread).await?;
         let thread_id = thread
@@ -344,17 +342,29 @@ impl SessionManager {
             Some(DownloadedAttachment::Voice {
                 path,
                 duration_seconds,
+                transcript,
             }) => {
                 let duration = duration_seconds
                     .map(|seconds| format!(" ({seconds}s)"))
                     .unwrap_or_default();
-                let prompt = format!(
-                    "Telegram user {} sent a voice message{}.\nLocal file path: `{}`.\nUse that file directly if needed.\n\n{}",
+                let mut prompt = format!(
+                    "Telegram user {} sent a voice message{}.\nLocal file path: `{}`.",
                     inbound.sender_name,
                     duration,
-                    path.display(),
-                    inbound.text.clone().unwrap_or_default()
+                    path.display()
                 );
+                if let Some(caption) = inbound.text.as_ref().filter(|text| !text.trim().is_empty())
+                {
+                    prompt.push_str("\nUser caption/context:\n");
+                    prompt.push_str(caption.trim());
+                }
+                if let Some(transcript) = transcript.as_ref().filter(|text| !text.trim().is_empty())
+                {
+                    prompt.push_str("\n\nVoice transcript:\n");
+                    prompt.push_str(transcript.trim());
+                } else {
+                    prompt.push_str("\n\nVoice transcript is unavailable.");
+                }
                 Input::text(prompt)
             }
             Some(DownloadedAttachment::File(path)) => {
@@ -729,15 +739,17 @@ async fn handle_live_notification(
 
 fn classify_notification(notification: &ServerNotification, thread_id: &str) -> NotificationMatch {
     match notification {
-        ServerNotification::TurnStarted(payload) => thread_buffer_match(&payload.turn.extra, thread_id),
-        ServerNotification::TurnCompleted(payload) => thread_buffer_match(&payload.turn.extra, thread_id),
+        ServerNotification::TurnStarted(payload) => {
+            thread_buffer_match(&payload.turn.extra, thread_id)
+        }
+        ServerNotification::TurnCompleted(payload) => {
+            thread_buffer_match(&payload.turn.extra, thread_id)
+        }
         ServerNotification::ItemCompleted(payload) => {
             thread_buffer_match(&payload.extra, thread_id)
         }
         ServerNotification::ItemAgentMessageDelta(delta)
-        | ServerNotification::ItemPlanDelta(delta) => {
-            thread_buffer_match(&delta.extra, thread_id)
-        }
+        | ServerNotification::ItemPlanDelta(delta) => thread_buffer_match(&delta.extra, thread_id),
         ServerNotification::Error(payload) => thread_buffer_match(&payload.extra, thread_id),
         _ => NotificationMatch::Ignore,
     }

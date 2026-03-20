@@ -5,6 +5,7 @@ mod markdown;
 mod service;
 mod state;
 mod telegram;
+mod transcription;
 
 use std::path::PathBuf;
 

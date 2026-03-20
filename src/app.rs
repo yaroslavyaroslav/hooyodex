@@ -14,8 +14,10 @@ use tracing::{error, info};
 use crate::codex::{ChatTurnRunner, OutputSink, SessionManager, TurnOutput};
 use crate::config::AppConfig;
 use crate::telegram::{
-    TelegramUpdate, download_attachment, normalize_update, send_markdown_message, send_photo,
+    DownloadedAttachment, TelegramUpdate, download_attachment, normalize_update,
+    send_markdown_message, send_photo,
 };
+use crate::transcription::transcribe_voice_message;
 
 #[derive(Clone)]
 struct AppState {
@@ -123,6 +125,25 @@ async fn process_telegram_update(
             return Ok(());
         }
     };
+    let attachment = match maybe_transcribe_voice_attachment(config, attachment).await {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            error!(
+                chat_id = inbound.chat_id,
+                sender_id = inbound.sender_id,
+                update_id = update.update_id,
+                "failed to transcribe Telegram voice message: {error}"
+            );
+            let _ = send_markdown_message(
+                config,
+                inbound.chat_id,
+                inbound.thread_id,
+                &format!("Voice transcription failed:\n\n```text\n{error}\n```"),
+            )
+            .await;
+            return Ok(());
+        }
+    };
 
     let chat_id = inbound.chat_id;
     let thread_id = inbound.thread_id;
@@ -147,6 +168,52 @@ async fn process_telegram_update(
             Ok(())
         }
     }
+}
+
+async fn maybe_transcribe_voice_attachment(
+    config: &AppConfig,
+    attachment: Option<DownloadedAttachment>,
+) -> Result<Option<DownloadedAttachment>> {
+    let attachment = match attachment {
+        Some(DownloadedAttachment::Voice {
+            path,
+            duration_seconds,
+            transcript,
+        }) => DownloadedAttachment::Voice {
+            path,
+            duration_seconds,
+            transcript,
+        },
+        other => return Ok(other),
+    };
+
+    let DownloadedAttachment::Voice {
+        path,
+        duration_seconds,
+        transcript,
+    } = attachment
+    else {
+        unreachable!("voice attachment just matched");
+    };
+
+    if !config.voice.enabled {
+        return Ok(Some(DownloadedAttachment::Voice {
+            path,
+            duration_seconds,
+            transcript,
+        }));
+    }
+
+    let transcript = match transcript {
+        Some(transcript) => Some(transcript),
+        None => Some(transcribe_voice_message(config, &path).await?),
+    };
+
+    Ok(Some(DownloadedAttachment::Voice {
+        path,
+        duration_seconds,
+        transcript,
+    }))
 }
 
 struct TelegramSink {
@@ -237,10 +304,12 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::codex::TurnOutput;
-    use crate::config::{AppConfig, AppPaths, CodexConfig, ServerConfig, TelegramConfig};
+    use crate::config::{
+        AppConfig, AppPaths, CodexConfig, ServerConfig, TelegramConfig, VoiceConfig,
+    };
     use crate::telegram::{
         DownloadedAttachment, InboundMessage, TelegramChat, TelegramMessage, TelegramUpdate,
-        TelegramUser, normalize_update,
+        TelegramUser, TelegramVoice, normalize_update,
     };
 
     #[derive(Clone, Debug)]
@@ -273,6 +342,30 @@ mod tests {
             for output in self.scripted_outputs.clone() {
                 sink.send(output).await?;
             }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingRunner {
+        inbound: Arc<Mutex<Vec<InboundMessage>>>,
+        attachments: Arc<Mutex<Vec<Option<DownloadedAttachment>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatTurnRunner for CapturingRunner {
+        async fn reset_chat(&self, _inbound: &InboundMessage) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run_chat_turn(
+            &self,
+            inbound: InboundMessage,
+            attachment: Option<DownloadedAttachment>,
+            _sink: &mut dyn OutputSink,
+        ) -> Result<()> {
+            self.inbound.lock().await.push(inbound);
+            self.attachments.lock().await.push(attachment);
             Ok(())
         }
     }
@@ -372,6 +465,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_update_transcribes_voice_before_running_turn() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let mut config = test_config(tempdir.path(), &mock.base_url);
+        config.voice.transcriber_command =
+            write_fake_parakeet_script(tempdir.path(), "decoded voice text")?;
+
+        let update = sample_voice_update();
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        let runner = CapturingRunner::default();
+
+        process_telegram_update(&runner, &config, update, inbound).await?;
+
+        let inbounds = runner.inbound.lock().await;
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0].text, None);
+
+        let attachments = runner.attachments.lock().await;
+        match attachments[0].as_ref().expect("attachment") {
+            DownloadedAttachment::Voice {
+                transcript,
+                duration_seconds,
+                ..
+            } => {
+                assert_eq!(transcript.as_deref(), Some("decoded voice text"));
+                assert_eq!(*duration_seconds, Some(7));
+            }
+            other => panic!("expected voice attachment, got {other:?}"),
+        }
+
+        let requests = mock.requests().await;
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path.ends_with("/getFile")),
+            "expected Telegram getFile request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     #[ignore = "requires live Codex auth/network; run manually"]
     async fn e2e_live_codex_streams_intermediate_messages_to_mock_telegram() -> Result<()> {
         let mock = start_mock_telegram_api().await?;
@@ -434,6 +568,11 @@ mod tests {
                 webhook_secret: "secret".to_string(),
                 api_base_url: api_base_url.to_string(),
             },
+            voice: VoiceConfig {
+                enabled: true,
+                transcriber_command: "parakeet-mlx".to_string(),
+                model: "mlx-community/parakeet-tdt-0.6b-v3".to_string(),
+            },
             codex: CodexConfig {
                 connect_url: "ws://127.0.0.1:4222".to_string(),
                 listen_url: "ws://127.0.0.1:4222".to_string(),
@@ -448,6 +587,35 @@ mod tests {
                 web_search_enabled: true,
                 orchestrator_name: None,
             },
+        }
+    }
+
+    fn sample_voice_update() -> TelegramUpdate {
+        TelegramUpdate {
+            update_id: 2,
+            message: Some(TelegramMessage {
+                message_id: 11,
+                chat: TelegramChat {
+                    id: 100,
+                    kind: "private".to_string(),
+                },
+                from: Some(TelegramUser {
+                    id: 42,
+                    first_name: Some("Test".to_string()),
+                    last_name: None,
+                }),
+                sender_chat: None,
+                text: None,
+                caption: None,
+                photo: None,
+                document: None,
+                voice: Some(TelegramVoice {
+                    file_id: "voice-1".to_string(),
+                    duration: Some(7),
+                }),
+                message_thread_id: None,
+            }),
+            edited_message: None,
         }
     }
 
@@ -529,7 +697,11 @@ mod tests {
                 path: uri.path().to_string(),
                 body: body.to_vec(),
             });
-            Json(json!({ "ok": true, "result": {} }))
+            if uri.path().ends_with("/getFile") {
+                Json(json!({ "ok": true, "result": { "file_path": "voice/file.ogg" } }))
+            } else {
+                Json(json!({ "ok": true, "result": {} }))
+            }
         }
 
         async fn file_response() -> &'static [u8] {
@@ -552,5 +724,22 @@ mod tests {
             base_url: format!("http://{}", address),
             state,
         })
+    }
+
+    fn write_fake_parakeet_script(root: &std::path::Path, transcript: &str) -> Result<String> {
+        let script_path = root.join("fake-parakeet.sh");
+        let script = format!(
+            "#!/bin/sh\nset -eu\noutput_dir=''\ntemplate=''\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --output-dir)\n      output_dir=\"$2\"\n      shift 2\n      ;;\n    --output-template)\n      template=\"$2\"\n      shift 2\n      ;;\n    *)\n      shift\n      ;;\n  esac\ndone\nmkdir -p \"$output_dir\"\nprintf '%s\\n' '{}' > \"$output_dir/$template.txt\"\n",
+            transcript.replace('\'', "'\"'\"'")
+        );
+        std::fs::write(&script_path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script_path)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script_path, permissions)?;
+        }
+        Ok(script_path.display().to_string())
     }
 }

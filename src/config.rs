@@ -30,6 +30,8 @@ pub struct AppConfig {
     pub paths: AppPaths,
     pub server: ServerConfig,
     pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub voice: VoiceConfig,
     pub codex: CodexConfig,
 }
 
@@ -46,6 +48,26 @@ pub struct TelegramConfig {
     pub webhook_secret: String,
     #[serde(default = "default_telegram_api_base")]
     pub api_base_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoiceConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_parakeet_command")]
+    pub transcriber_command: String,
+    #[serde(default = "default_parakeet_model")]
+    pub model: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            transcriber_command: default_parakeet_command(),
+            model: default_parakeet_model(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -164,6 +186,14 @@ fn default_codex_connect_url() -> String {
     "ws://127.0.0.1:4222".to_string()
 }
 
+fn default_parakeet_command() -> String {
+    "parakeet-mlx".to_string()
+}
+
+fn default_parakeet_model() -> String {
+    "mlx-community/parakeet-tdt-0.6b-v3".to_string()
+}
+
 fn default_codex_listen_url() -> String {
     "ws://127.0.0.1:4222".to_string()
 }
@@ -205,6 +235,9 @@ allowed_user_ids = [1]
 public_base_url = "https://example.com/base"
 webhook_secret = "secret"
 
+[voice]
+enabled = true
+
 [codex]
 working_directory = "/tmp"
 "#,
@@ -221,5 +254,7 @@ working_directory = "/tmp"
             config.webhook_url(),
             "https://example.com/base/telegram/secret"
         );
+        assert_eq!(config.voice.transcriber_command, "parakeet-mlx");
+        assert_eq!(config.voice.model, "mlx-community/parakeet-tdt-0.6b-v3");
     }
 }

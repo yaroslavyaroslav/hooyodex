@@ -8,6 +8,11 @@ public_base_url = "https://example.com"
 webhook_secret = "replace-with-random-secret"
 api_base_url = "https://api.telegram.org"
 
+[voice]
+enabled = true
+transcriber_command = "parakeet-mlx"
+model = "mlx-community/parakeet-tdt-0.6b-v3"
+
 [codex]
 connect_url = "ws://127.0.0.1:4222"
 listen_url = "ws://127.0.0.1:4222"
@@ -24,4 +29,3 @@ skip_git_repo_check = true
 network_access_enabled = true
 web_search_enabled = true
 orchestrator_name = "codexclaw-orchestrator"
-

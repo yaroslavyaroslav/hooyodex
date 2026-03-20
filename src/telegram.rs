@@ -90,6 +90,7 @@ pub enum DownloadedAttachment {
     Voice {
         path: PathBuf,
         duration_seconds: Option<u32>,
+        transcript: Option<String>,
     },
 }
 
@@ -328,6 +329,7 @@ pub async fn download_attachment(
         return Ok(Some(DownloadedAttachment::Voice {
             path,
             duration_seconds: inbound.voice_duration,
+            transcript: None,
         }));
     }
 
