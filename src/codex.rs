@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -13,7 +14,7 @@ use codex_app_server_sdk::protocol::notifications::ItemLifecycleNotification;
 use codex_app_server_sdk::protocol::requests;
 use codex_app_server_sdk::{WsConfig, WsServerHandle, WsStartConfig};
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, warn};
 
 use crate::config::AppConfig;
@@ -31,6 +32,7 @@ pub struct SessionManager {
     sessions_path: PathBuf,
     state: Mutex<PersistentState>,
     chats: Mutex<HashMap<String, Arc<Mutex<Thread>>>>,
+    active_turns: Mutex<HashMap<String, Arc<ActiveChatTurn>>>,
     orchestrator: Mutex<Option<Arc<Mutex<Thread>>>>,
 }
 
@@ -45,6 +47,21 @@ struct LiveTextState {
     pending_key: Option<String>,
     pending_item: Option<ThreadItem>,
     sent_keys: HashSet<String>,
+}
+
+struct ActiveChatTurn {
+    thread_id: String,
+    start_state: Mutex<TurnStartState>,
+    start_notify: Notify,
+    steer_lock: Mutex<()>,
+    finished: AtomicBool,
+}
+
+#[derive(Clone, Debug)]
+enum TurnStartState {
+    Pending,
+    Ready(String),
+    Failed(String),
 }
 
 #[async_trait]
@@ -101,6 +118,48 @@ impl CodexRuntime {
     }
 }
 
+impl ActiveChatTurn {
+    fn new(thread_id: String) -> Self {
+        Self {
+            thread_id,
+            start_state: Mutex::new(TurnStartState::Pending),
+            start_notify: Notify::new(),
+            steer_lock: Mutex::new(()),
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    async fn publish_turn_start(&self, result: std::result::Result<String, String>) {
+        let mut state = self.start_state.lock().await;
+        *state = match result {
+            Ok(turn_id) => TurnStartState::Ready(turn_id),
+            Err(error) => TurnStartState::Failed(error),
+        };
+        drop(state);
+        self.start_notify.notify_waiters();
+    }
+
+    async fn wait_for_turn_id(&self) -> Result<String> {
+        loop {
+            let state = self.start_state.lock().await.clone();
+            match state {
+                TurnStartState::Pending => self.start_notify.notified().await,
+                TurnStartState::Ready(turn_id) => return Ok(turn_id),
+                TurnStartState::Failed(error) => return Err(anyhow!(error)),
+            }
+        }
+    }
+
+    fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Release);
+        self.start_notify.notify_waiters();
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
 impl SessionManager {
     pub async fn new(config: AppConfig) -> Result<Self> {
         let runtime = CodexRuntime::start(&config).await?;
@@ -111,6 +170,7 @@ impl SessionManager {
             config,
             state: Mutex::new(state),
             chats: Mutex::new(HashMap::new()),
+            active_turns: Mutex::new(HashMap::new()),
             orchestrator: Mutex::new(None),
         })
     }
@@ -156,25 +216,50 @@ impl SessionManager {
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
         let key = inbound.chat_id.to_string();
-        let session = self.get_or_create_chat_thread(&key).await?;
         let input = self.build_input(&inbound, attachment);
+
+        if self.try_steer_active_turn(&key, &input).await? {
+            return Ok(());
+        }
+
+        let session = self.get_or_create_chat_thread(&key).await?;
+        let mut thread = session.lock().await;
+        if let Some(active) = self.current_active_turn(&key).await {
+            drop(thread);
+            self.steer_active_turn(active, input).await?;
+            return Ok(());
+        }
 
         let mut text_state = LiveTextState::default();
         let mut sent_images = HashSet::new();
 
-        let mut thread = session.lock().await;
         let thread_id = prepare_live_thread(&mut *thread).await?;
+        let active_turn = Arc::new(ActiveChatTurn::new(thread_id.clone()));
+        self.active_turns
+            .lock()
+            .await
+            .insert(key.clone(), active_turn.clone());
+        drop(thread);
+
+        self.persist_chat_thread_id(&key, &thread_id).await?;
+
         let turn_params = self.build_live_turn_start_params(&thread_id, input);
         let client = self.runtime.codex.client();
         let mut server_events = client.subscribe();
         let (tx, mut rx) = mpsc::channel(512);
 
         let turn_start_tx = tx.clone();
+        let active_for_start = active_turn.clone();
         tokio::spawn(async move {
             let result = client
                 .turn_start(turn_params)
                 .await
                 .map(|response| response.turn.id);
+            let start_state = match &result {
+                Ok(turn_id) => Ok(turn_id.clone()),
+                Err(error) => Err(error.to_string()),
+            };
+            active_for_start.publish_turn_start(start_state).await;
             let _ = turn_start_tx
                 .send(LiveTurnEvent::TurnStartResult(result))
                 .await;
@@ -201,72 +286,70 @@ impl SessionManager {
 
         let mut active_turn_id = None;
         let mut buffered_notifications = Vec::new();
-        while let Some(event) = rx.recv().await {
-            match event {
-                LiveTurnEvent::TurnStartResult(result) => {
-                    let turn_id = result?;
-                    active_turn_id = Some(turn_id.clone());
-                    let terminal = replay_buffered_notifications(
-                        &buffered_notifications,
-                        &thread_id,
-                        &turn_id,
-                        &mut text_state,
-                        &mut sent_images,
-                        sink,
-                    )
-                    .await?;
-                    buffered_notifications.clear();
-                    if terminal {
-                        break;
-                    }
-                }
-                LiveTurnEvent::Server(ServerEvent::Notification(notification)) => {
-                    if active_turn_id.is_none() {
-                        match classify_notification(&notification, &thread_id) {
-                            NotificationMatch::CurrentThreadBuffered => {
-                                buffered_notifications.push(notification);
-                            }
-                            NotificationMatch::Ignore => {}
-                        }
-                        continue;
-                    }
-
-                    let turn_id = active_turn_id.as_deref().expect("turn id just checked");
-                    maybe_flush_on_successor_notification(&notification, &mut text_state, sink)
+        let stream_result: Result<()> = async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    LiveTurnEvent::TurnStartResult(result) => {
+                        let turn_id = result?;
+                        active_turn_id = Some(turn_id.clone());
+                        let terminal = replay_buffered_notifications(
+                            &buffered_notifications,
+                            &thread_id,
+                            &turn_id,
+                            &mut text_state,
+                            &mut sent_images,
+                            sink,
+                        )
                         .await?;
-                    if handle_live_notification(
-                        notification,
-                        &thread_id,
-                        turn_id,
-                        &mut text_state,
-                        &mut sent_images,
-                        sink,
-                    )
-                    .await?
-                    .is_terminal()
-                    {
-                        break;
+                        buffered_notifications.clear();
+                        if terminal {
+                            break;
+                        }
+                    }
+                    LiveTurnEvent::Server(ServerEvent::Notification(notification)) => {
+                        if active_turn_id.is_none() {
+                            match classify_notification(&notification, &thread_id) {
+                                NotificationMatch::CurrentThreadBuffered => {
+                                    buffered_notifications.push(notification);
+                                }
+                                NotificationMatch::Ignore => {}
+                            }
+                            continue;
+                        }
+
+                        let turn_id = active_turn_id.as_deref().expect("turn id just checked");
+                        maybe_flush_on_successor_notification(&notification, &mut text_state, sink)
+                            .await?;
+                        if handle_live_notification(
+                            notification,
+                            &thread_id,
+                            turn_id,
+                            &mut text_state,
+                            &mut sent_images,
+                            sink,
+                        )
+                        .await?
+                        .is_terminal()
+                        {
+                            break;
+                        }
+                    }
+                    LiveTurnEvent::Server(ServerEvent::ServerRequest(_)) => {
+                        flush_completed_text_item(&mut text_state, sink).await?;
+                    }
+                    LiveTurnEvent::Server(ServerEvent::TransportClosed)
+                    | LiveTurnEvent::TransportClosed => {
+                        return Err(anyhow!("Codex event stream closed"));
                     }
                 }
-                LiveTurnEvent::Server(ServerEvent::ServerRequest(_)) => {
-                    flush_completed_text_item(&mut text_state, sink).await?;
-                }
-                LiveTurnEvent::Server(ServerEvent::TransportClosed)
-                | LiveTurnEvent::TransportClosed => {
-                    return Err(anyhow!("Codex event stream closed"));
-                }
             }
+            Ok(())
         }
+        .await;
 
-        if let Some(id) = thread.id().map(ToString::to_string) {
-            let mut state = self.state.lock().await;
-            if state.chat_threads.get(&key) != Some(&id) {
-                state.chat_threads.insert(key, id);
-                state.save(&self.sessions_path)?;
-            }
-        }
-
-        Ok(())
+        active_turn.mark_finished();
+        self.remove_active_turn(&key, &active_turn).await;
+        stream_result
     }
 
     pub async fn reset_chat_thread(&self, inbound: &InboundMessage) -> Result<()> {
@@ -282,6 +365,7 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("thread id unavailable after reset"))?;
         drop(thread);
 
+        self.active_turns.lock().await.remove(&key);
         self.chats.lock().await.insert(key.clone(), session);
 
         let mut state = self.state.lock().await;
@@ -309,6 +393,67 @@ impl SessionManager {
             .await
             .insert(key.to_string(), session.clone());
         Ok(session)
+    }
+
+    async fn current_active_turn(&self, key: &str) -> Option<Arc<ActiveChatTurn>> {
+        self.active_turns.lock().await.get(key).cloned()
+    }
+
+    async fn remove_active_turn(&self, key: &str, active_turn: &Arc<ActiveChatTurn>) {
+        let mut active_turns = self.active_turns.lock().await;
+        if active_turns
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, active_turn))
+        {
+            active_turns.remove(key);
+        }
+    }
+
+    async fn try_steer_active_turn(&self, key: &str, input: &Input) -> Result<bool> {
+        loop {
+            let Some(active) = self.current_active_turn(key).await else {
+                return Ok(false);
+            };
+            if active.is_finished() {
+                self.remove_active_turn(key, &active).await;
+                continue;
+            }
+            self.steer_active_turn(active, input.clone()).await?;
+            return Ok(true);
+        }
+    }
+
+    async fn steer_active_turn(&self, active: Arc<ActiveChatTurn>, input: Input) -> Result<()> {
+        let _guard = active.steer_lock.lock().await;
+        if active.is_finished() {
+            return Ok(());
+        }
+        let turn_id = active.wait_for_turn_id().await?;
+        if active.is_finished() {
+            return Ok(());
+        }
+        self.runtime
+            .codex
+            .client()
+            .turn_steer(requests::TurnSteerParams {
+                thread_id: active.thread_id.clone(),
+                input: normalize_input_local(input),
+                expected_turn_id: Some(turn_id),
+                extra: Map::new(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_chat_thread_id(&self, key: &str, thread_id: &str) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.chat_threads.get(key).map(String::as_str) != Some(thread_id) {
+            state
+                .chat_threads
+                .insert(key.to_string(), thread_id.to_string());
+            state.save(&self.sessions_path)?;
+        }
+        Ok(())
     }
 
     fn build_input(
@@ -1520,6 +1665,37 @@ mod tests {
                 .to_string()
                 .contains("connection not ready: call initialized() before invoking turn/start")
         );
+    }
+
+    #[tokio::test]
+    async fn active_turn_waits_until_turn_id_is_published() -> Result<()> {
+        let active = Arc::new(ActiveChatTurn::new("thread-1".to_string()));
+        let waiting = active.clone();
+        let waiter = tokio::spawn(async move { waiting.wait_for_turn_id().await });
+
+        tokio::task::yield_now().await;
+        active.publish_turn_start(Ok("turn-1".to_string())).await;
+
+        assert_eq!(waiter.await??, "turn-1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_turn_propagates_start_failure_to_steer_waiters() {
+        let active = Arc::new(ActiveChatTurn::new("thread-1".to_string()));
+        let waiting = active.clone();
+        let waiter = tokio::spawn(async move { waiting.wait_for_turn_id().await });
+
+        tokio::task::yield_now().await;
+        active
+            .publish_turn_start(Err("turn start failed".to_string()))
+            .await;
+
+        let error = waiter
+            .await
+            .expect("wait task must join")
+            .expect_err("waiter must see start failure");
+        assert!(error.to_string().contains("turn start failed"));
     }
 
     #[test]
