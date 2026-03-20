@@ -232,6 +232,8 @@ impl SessionManager {
                     }
 
                     let turn_id = active_turn_id.as_deref().expect("turn id just checked");
+                    maybe_flush_on_successor_notification(&notification, &mut text_state, sink)
+                        .await?;
                     if handle_live_notification(
                         notification,
                         &thread_id,
@@ -246,11 +248,13 @@ impl SessionManager {
                         break;
                     }
                 }
+                LiveTurnEvent::Server(ServerEvent::ServerRequest(_)) => {
+                    flush_completed_text_item(&mut text_state, sink).await?;
+                }
                 LiveTurnEvent::Server(ServerEvent::TransportClosed)
                 | LiveTurnEvent::TransportClosed => {
                     return Err(anyhow!("Codex event stream closed"));
                 }
-                LiveTurnEvent::Server(ServerEvent::ServerRequest(_)) => {}
             }
         }
 
@@ -708,6 +712,25 @@ async fn handle_live_notification(
     Ok(LiveNotificationOutcome::Continue)
 }
 
+async fn maybe_flush_on_successor_notification(
+    notification: &ServerNotification,
+    text_state: &mut LiveTextState,
+    sink: &mut dyn OutputSink,
+) -> Result<()> {
+    let Some(pending_key) = text_state.pending_key.as_deref() else {
+        return Ok(());
+    };
+
+    if notification_successor_key(notification)
+        .as_deref()
+        .is_some_and(|key| key == pending_key)
+    {
+        return Ok(());
+    }
+
+    flush_completed_text_item(text_state, sink).await
+}
+
 fn classify_notification(notification: &ServerNotification, thread_id: &str) -> NotificationMatch {
     match notification {
         ServerNotification::TurnStarted(payload) => {
@@ -767,6 +790,46 @@ fn normalized_approval_policy(value: &str) -> &'static str {
         "on-failure" => "on-failure",
         "untrusted" => "untrusted",
         _ => "never",
+    }
+}
+
+fn notification_successor_key(notification: &ServerNotification) -> Option<String> {
+    match notification {
+        ServerNotification::ItemStarted(payload) | ServerNotification::ItemCompleted(payload) => {
+            live_text_item_key_from_value(&payload.item)
+        }
+        ServerNotification::ItemCommandExecutionOutputDelta(payload)
+        | ServerNotification::ItemCommandExecutionTerminalInteraction(payload)
+        | ServerNotification::ItemFileChangeOutputDelta(payload)
+        | ServerNotification::ItemMcpToolCallProgress(payload)
+        | ServerNotification::ItemReasoningSummaryTextDelta(payload)
+        | ServerNotification::ItemReasoningSummaryPartAdded(payload)
+        | ServerNotification::ItemReasoningTextDelta(payload) => payload
+            .item_id
+            .as_ref()
+            .map(|item_id| format!("agent:{item_id}")),
+        ServerNotification::ItemAgentMessageDelta(_)
+        | ServerNotification::ItemPlanDelta(_)
+        | ServerNotification::TurnStarted(_)
+        | ServerNotification::TurnCompleted(_)
+        | ServerNotification::TurnDiffUpdated(_)
+        | ServerNotification::TurnPlanUpdated(_)
+        | ServerNotification::Error(_)
+        | ServerNotification::ThreadTokenUsageUpdated(_)
+        | ServerNotification::RawResponseItemCompleted(_)
+        | ServerNotification::ServerRequestResolved(_)
+        | ServerNotification::Unknown { .. } => Some("__different-successor__".to_string()),
+        _ => None,
+    }
+}
+
+fn live_text_item_key_from_value(item: &Value) -> Option<String> {
+    let object = item.as_object()?;
+    let item_id = object.get("id").and_then(Value::as_str)?;
+    let item_type = object.get("type").and_then(Value::as_str)?;
+    match item_type {
+        "agentMessage" => Some(format!("agent:{item_id}")),
+        _ => None,
     }
 }
 
@@ -1128,6 +1191,23 @@ mod tests {
         }
     }
 
+    fn started_dynamic_tool_call(
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        tool: &str,
+    ) -> ItemLifecycleNotification {
+        ItemLifecycleNotification {
+            item: json!({
+                "id": item_id,
+                "type": "dynamicToolCall",
+                "tool": tool,
+                "status": "in_progress",
+            }),
+            extra: live_extra(thread_id, turn_id),
+        }
+    }
+
     fn completed_turn(thread_id: &str, turn_id: &str) -> ServerNotification {
         ServerNotification::TurnCompleted(
             codex_app_server_sdk::protocol::notifications::TurnCompletedNotification {
@@ -1337,6 +1417,48 @@ mod tests {
         assert!(matches!(
             sink.outputs.get(2),
             Some(TurnOutput::Markdown(text)) if text == "Готовый финальный ответ"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flushes_completed_commentary_on_next_tool_lifecycle_event() -> Result<()> {
+        let mut text_state = LiveTextState::default();
+        let mut sent_images = HashSet::new();
+        let mut sink = RecordingSink::default();
+
+        handle_live_notification(
+            ServerNotification::ItemCompleted(completed_agent_message(
+                "thread-1",
+                "turn-1",
+                "msg-1",
+                "commentary",
+                "Checking the external source now",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        assert!(sink.outputs.is_empty());
+
+        maybe_flush_on_successor_notification(
+            &ServerNotification::ItemStarted(started_dynamic_tool_call(
+                "thread-1", "turn-1", "tool-1", "time",
+            )),
+            &mut text_state,
+            &mut sink,
+        )
+        .await?;
+
+        assert_eq!(sink.outputs.len(), 1);
+        assert!(matches!(
+            sink.outputs.first(),
+            Some(TurnOutput::Markdown(text)) if text == "Checking the external source now"
         ));
 
         Ok(())
