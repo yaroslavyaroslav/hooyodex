@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_update_sends_each_markdown_chunk_to_telegram() -> Result<()> {
+    async fn process_update_sends_each_turn_output_to_telegram() -> Result<()> {
         let mock = start_mock_telegram_api().await?;
         let tempdir = TempDir::new()?;
         let config = test_config(tempdir.path(), &mock.base_url);
@@ -544,9 +544,53 @@ mod tests {
             messages.iter().any(|message| message.contains("DONE")),
             "expected a final Telegram message containing DONE, got:\n{transcript}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Codex auth/network; run manually"]
+    async fn e2e_live_codex_time_tool_outputs_do_not_fragment_into_tiny_messages() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = live_e2e_config(tempdir.path(), &mock.base_url)?;
+        let sessions = SessionManager::new(config.clone()).await?;
+        sessions.ensure_orchestrator().await?;
+
+        let update = sample_update_with_text(
+            "Use the external time service to check the current time in UTC+02:00. While you work, send exactly two intermediate user-visible updates, `STEP_ONE` and `STEP_TWO`, and then return one short final answer in English.",
+        );
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+
+        process_telegram_update(&sessions, &config, update, inbound).await?;
+
+        let requests = mock.requests().await;
+        let messages: Vec<String> = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/sendMessage"))
+            .map(|request| {
+                let value: Value = serde_json::from_slice(&request.body).expect("sendMessage json");
+                value["text"].as_str().unwrap_or_default().to_string()
+            })
+            .collect();
+
+        let transcript = messages.join("\n---\n");
         assert!(
-            messages.len() >= 3,
-            "expected at least three Telegram messages (2 intermediate + final), got:\n{transcript}"
+            !messages.is_empty(),
+            "expected at least one Telegram message, got none"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("STEP_ONE")),
+            "expected an intermediate Telegram message containing STEP_ONE, got:\n{transcript}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("STEP_TWO")),
+            "expected an intermediate Telegram message containing STEP_TWO, got:\n{transcript}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message == "через" || message == "внешний" || message == "источник"),
+            "expected no tiny delta fragments, got:\n{transcript}"
         );
         Ok(())
     }

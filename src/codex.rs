@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -10,12 +9,12 @@ use codex_app_server_sdk::api::{
     ThreadItem, ThreadOptions, TurnOptions, UserInput, WebSearchMode,
 };
 use codex_app_server_sdk::events::{ServerEvent, ServerNotification};
-use codex_app_server_sdk::protocol::notifications::{DeltaNotification, ItemLifecycleNotification};
+use codex_app_server_sdk::protocol::notifications::ItemLifecycleNotification;
 use codex_app_server_sdk::protocol::requests;
 use codex_app_server_sdk::{WsConfig, WsServerHandle, WsStartConfig};
 use serde_json::{Map, Value};
 use tokio::sync::{Mutex, mpsc};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::AppConfig;
 use crate::state::PersistentState;
@@ -39,6 +38,13 @@ pub struct SessionManager {
 pub enum TurnOutput {
     Markdown(String),
     Image(PathBuf),
+}
+
+#[derive(Default)]
+struct LiveTextState {
+    pending_key: Option<String>,
+    pending_item: Option<ThreadItem>,
+    sent_keys: HashSet<String>,
 }
 
 #[async_trait]
@@ -153,9 +159,8 @@ impl SessionManager {
         let session = self.get_or_create_chat_thread(&key).await?;
         let input = self.build_input(&inbound, attachment);
 
-        let mut sent_text = HashMap::new();
+        let mut text_state = LiveTextState::default();
         let mut sent_images = HashSet::new();
-        let mut delta_state = DeltaState::default();
 
         let mut thread = session.lock().await;
         let thread_id = prepare_live_thread(&mut *thread).await?;
@@ -196,70 +201,56 @@ impl SessionManager {
 
         let mut active_turn_id = None;
         let mut buffered_notifications = Vec::new();
-        let mut turn_completed = false;
-        loop {
-            let recv = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await;
-            match recv {
-                Ok(Some(event)) => match event {
-                    LiveTurnEvent::TurnStartResult(result) => {
-                        let turn_id = result?;
-                        active_turn_id = Some(turn_id.clone());
-                        if replay_buffered_notifications(
-                            &buffered_notifications,
-                            &thread_id,
-                            &turn_id,
-                            &mut delta_state,
-                            &mut sent_text,
-                            &mut sent_images,
-                            sink,
-                        )
-                        .await?
-                        {
-                            turn_completed = true;
-                        }
-                        buffered_notifications.clear();
-                    }
-                    LiveTurnEvent::Server(ServerEvent::Notification(notification)) => {
-                        if active_turn_id.is_none() {
-                            match classify_notification(&notification, &thread_id) {
-                                NotificationMatch::CurrentThreadBuffered => {
-                                    buffered_notifications.push(notification);
-                                }
-                                NotificationMatch::Ignore => {}
-                            }
-                            continue;
-                        }
-
-                        let turn_id = active_turn_id.as_deref().expect("turn id just checked");
-                        if handle_live_notification(
-                            notification,
-                            &thread_id,
-                            turn_id,
-                            &mut delta_state,
-                            &mut sent_text,
-                            &mut sent_images,
-                            sink,
-                        )
-                        .await?
-                        .is_terminal()
-                        {
-                            turn_completed = true;
-                        }
-                    }
-                    LiveTurnEvent::Server(ServerEvent::TransportClosed)
-                    | LiveTurnEvent::TransportClosed => {
-                        return Err(anyhow!("Codex event stream closed"));
-                    }
-                    LiveTurnEvent::Server(ServerEvent::ServerRequest(_)) => {}
-                },
-                Ok(None) => break,
-                Err(_) => {
-                    flush_ready_delta_chunks(&mut delta_state, &mut sent_text, sink).await?;
-                    if turn_completed {
-                        flush_all_delta_chunks(&mut delta_state, &mut sent_text, sink).await?;
+        while let Some(event) = rx.recv().await {
+            match event {
+                LiveTurnEvent::TurnStartResult(result) => {
+                    let turn_id = result?;
+                    active_turn_id = Some(turn_id.clone());
+                    let terminal = replay_buffered_notifications(
+                        &buffered_notifications,
+                        &thread_id,
+                        &turn_id,
+                        &mut text_state,
+                        &mut sent_images,
+                        sink,
+                    )
+                    .await?;
+                    buffered_notifications.clear();
+                    if terminal {
                         break;
                     }
                 }
+                LiveTurnEvent::Server(ServerEvent::Notification(notification)) => {
+                    if active_turn_id.is_none() {
+                        match classify_notification(&notification, &thread_id) {
+                            NotificationMatch::CurrentThreadBuffered => {
+                                buffered_notifications.push(notification);
+                            }
+                            NotificationMatch::Ignore => {}
+                        }
+                        continue;
+                    }
+
+                    let turn_id = active_turn_id.as_deref().expect("turn id just checked");
+                    if handle_live_notification(
+                        notification,
+                        &thread_id,
+                        turn_id,
+                        &mut text_state,
+                        &mut sent_images,
+                        sink,
+                    )
+                    .await?
+                    .is_terminal()
+                    {
+                        break;
+                    }
+                }
+                LiveTurnEvent::Server(ServerEvent::TransportClosed)
+                | LiveTurnEvent::TransportClosed => {
+                    return Err(anyhow!("Codex event stream closed"));
+                }
+                LiveTurnEvent::Server(ServerEvent::ServerRequest(_)) => {}
             }
         }
 
@@ -490,6 +481,7 @@ impl ChatTurnRunner for SessionManager {
     }
 }
 
+#[cfg(test)]
 fn next_text_chunk(item: &ThreadItem, sent_text: &mut HashMap<String, String>) -> Option<String> {
     match item {
         ThreadItem::AgentMessage(message) => next_delta_chunk(
@@ -508,6 +500,7 @@ fn next_text_chunk(item: &ThreadItem, sent_text: &mut HashMap<String, String>) -
     }
 }
 
+#[cfg(test)]
 fn next_delta_chunk(
     key: String,
     text: &str,
@@ -579,12 +572,6 @@ enum LiveTurnEvent {
     TransportClosed,
 }
 
-#[derive(Default)]
-struct DeltaState {
-    item_text: HashMap<String, String>,
-    ready_items: HashSet<String>,
-}
-
 enum LiveNotificationOutcome {
     Continue,
     Terminal,
@@ -642,8 +629,7 @@ async fn replay_buffered_notifications(
     buffered_notifications: &[ServerNotification],
     thread_id: &str,
     turn_id: &str,
-    delta_state: &mut DeltaState,
-    sent_text: &mut HashMap<String, String>,
+    text_state: &mut LiveTextState,
     sent_images: &mut HashSet<String>,
     sink: &mut dyn OutputSink,
 ) -> Result<bool> {
@@ -653,8 +639,7 @@ async fn replay_buffered_notifications(
             notification,
             thread_id,
             turn_id,
-            delta_state,
-            sent_text,
+            text_state,
             sent_images,
             sink,
         )
@@ -671,8 +656,7 @@ async fn handle_live_notification(
     notification: ServerNotification,
     thread_id: &str,
     turn_id: &str,
-    delta_state: &mut DeltaState,
-    sent_text: &mut HashMap<String, String>,
+    text_state: &mut LiveTextState,
     sent_images: &mut HashSet<String>,
     sink: &mut dyn OutputSink,
 ) -> Result<LiveNotificationOutcome> {
@@ -682,33 +666,19 @@ async fn handle_live_notification(
             if live_matches_item(&payload, thread_id, turn_id) =>
         {
             if let Some(item) = parse_live_item(&payload) {
-                clear_delta_state_for_completed_item(delta_state, &item);
-                if let Some(chunk) = next_text_chunk(&item, sent_text) {
-                    sink.send(TurnOutput::Markdown(chunk)).await?;
-                }
+                log_live_completed_item(&item);
                 if let Some(image_path) = next_image_path(&item, sent_images) {
                     sink.send(TurnOutput::Image(image_path)).await?;
                 }
+                if let Some(key) = live_text_item_key(&item) {
+                    queue_completed_text_item(text_state, key, item, sink).await?;
+                } else {
+                    flush_completed_text_item(text_state, sink).await?;
+                }
             }
         }
-        ServerNotification::ItemAgentMessageDelta(delta)
-            if live_matches_delta(&delta, thread_id, turn_id) =>
-        {
-            if let Some(item) = append_delta_item(delta_state, "agent", &delta, false)
-                && let Some(chunk) = next_text_chunk(&item, sent_text)
-            {
-                sink.send(TurnOutput::Markdown(chunk)).await?;
-            }
-        }
-        ServerNotification::ItemPlanDelta(delta)
-            if live_matches_delta(&delta, thread_id, turn_id) =>
-        {
-            if let Some(item) = append_delta_item(delta_state, "plan", &delta, true)
-                && let Some(chunk) = next_text_chunk(&item, sent_text)
-            {
-                sink.send(TurnOutput::Markdown(chunk)).await?;
-            }
-        }
+        ServerNotification::ItemAgentMessageDelta(_) => {}
+        ServerNotification::ItemPlanDelta(_) => {}
         ServerNotification::TurnStarted(payload) if payload.turn.id == turn_id => {}
         ServerNotification::TurnCompleted(payload) if payload.turn.id == turn_id => {
             if payload
@@ -724,6 +694,7 @@ async fn handle_live_notification(
                     .unwrap_or_else(|| "turn failed".to_string());
                 return Err(anyhow!(message));
             }
+            flush_completed_text_item(text_state, sink).await?;
             return Ok(LiveNotificationOutcome::Terminal);
         }
         ServerNotification::Error(payload)
@@ -748,8 +719,6 @@ fn classify_notification(notification: &ServerNotification, thread_id: &str) -> 
         ServerNotification::ItemCompleted(payload) => {
             thread_buffer_match(&payload.extra, thread_id)
         }
-        ServerNotification::ItemAgentMessageDelta(delta)
-        | ServerNotification::ItemPlanDelta(delta) => thread_buffer_match(&delta.extra, thread_id),
         ServerNotification::Error(payload) => thread_buffer_match(&payload.extra, thread_id),
         _ => NotificationMatch::Ignore,
     }
@@ -764,10 +733,6 @@ fn thread_buffer_match(extra: &Map<String, Value>, thread_id: &str) -> Notificat
 }
 
 fn live_matches_item(payload: &ItemLifecycleNotification, thread_id: &str, turn_id: &str) -> bool {
-    matches_target_from_extra_strict(&payload.extra, thread_id, turn_id)
-}
-
-fn live_matches_delta(payload: &DeltaNotification, thread_id: &str, turn_id: &str) -> bool {
     matches_target_from_extra_strict(&payload.extra, thread_id, turn_id)
 }
 
@@ -805,109 +770,88 @@ fn normalized_approval_policy(value: &str) -> &'static str {
     }
 }
 
-fn append_delta_item(
-    delta_state: &mut DeltaState,
-    prefix: &str,
-    payload: &DeltaNotification,
-    flush_on_newline: bool,
-) -> Option<ThreadItem> {
-    let delta = payload
-        .delta
-        .as_deref()
-        .or(payload.text.as_deref())
-        .unwrap_or_default();
-    if delta.is_empty() {
-        return None;
+fn live_text_item_key(item: &ThreadItem) -> Option<String> {
+    match item {
+        ThreadItem::AgentMessage(message) if should_forward_message(message) => {
+            Some(format!("agent:{}", message.id))
+        }
+        _ => None,
     }
-
-    let item_id = payload.item_id.clone().unwrap_or_default();
-    let key = format!("{prefix}:{item_id}");
-    let full_text = delta_state.item_text.entry(key.clone()).or_default();
-    full_text.push_str(delta);
-
-    let should_flush = flush_on_newline
-        || delta.ends_with('\n')
-        || delta.ends_with('.')
-        || delta.ends_with('!')
-        || delta.ends_with('?')
-        || delta.starts_with(' ')
-        || delta.len() >= 24;
-
-    if !should_flush {
-        return None;
-    }
-
-    delta_state.ready_items.insert(key);
-    build_delta_item(prefix, item_id, full_text.clone())
 }
 
-async fn flush_ready_delta_chunks(
-    delta_state: &mut DeltaState,
-    sent_text: &mut HashMap<String, String>,
+fn completed_text_from_item(item: &ThreadItem) -> Option<String> {
+    match item {
+        ThreadItem::AgentMessage(message) if should_forward_message(message) => {
+            Some(message.text.clone())
+        }
+        _ => None,
+    }
+}
+
+fn log_live_completed_item(item: &ThreadItem) {
+    match item {
+        ThreadItem::AgentMessage(message) => {
+            debug!(
+                item_id = %message.id,
+                phase = ?message.phase,
+                text_len = message.text.chars().count(),
+                text = %message.text,
+                "live item/completed agent message"
+            );
+        }
+        ThreadItem::Plan(plan) => {
+            debug!(
+                item_id = %plan.id,
+                text_len = plan.text.chars().count(),
+                text = %plan.text,
+                "live item/completed plan"
+            );
+        }
+        ThreadItem::ImageView(image) => {
+            debug!(item_id = %image.id, path = %image.path, "live item/completed image");
+        }
+        _ => {}
+    }
+}
+
+async fn queue_completed_text_item(
+    state: &mut LiveTextState,
+    key: String,
+    item: ThreadItem,
     sink: &mut dyn OutputSink,
 ) -> Result<()> {
-    if delta_state.ready_items.is_empty() {
+    if state.sent_keys.contains(&key) {
         return Ok(());
     }
 
-    let ready_keys: Vec<String> = delta_state.ready_items.drain().collect();
-    for key in ready_keys {
-        let Some((prefix, item_id)) = key.split_once(':') else {
-            continue;
-        };
-        let Some(full_text) = delta_state.item_text.get(&key).cloned() else {
-            continue;
-        };
-        if let Some(item) = build_delta_item(prefix, item_id.to_string(), full_text)
-            && let Some(chunk) = next_text_chunk(&item, sent_text)
-        {
-            sink.send(TurnOutput::Markdown(chunk)).await?;
-        }
+    if state.pending_key.as_deref() == Some(key.as_str()) {
+        state.pending_item = Some(item);
+        return Ok(());
     }
+
+    flush_completed_text_item(state, sink).await?;
+    state.pending_key = Some(key);
+    state.pending_item = Some(item);
     Ok(())
 }
 
-async fn flush_all_delta_chunks(
-    delta_state: &mut DeltaState,
-    sent_text: &mut HashMap<String, String>,
+async fn flush_completed_text_item(
+    state: &mut LiveTextState,
     sink: &mut dyn OutputSink,
 ) -> Result<()> {
-    delta_state
-        .ready_items
-        .extend(delta_state.item_text.keys().cloned());
-    flush_ready_delta_chunks(delta_state, sent_text, sink).await
-}
-
-fn clear_delta_state_for_completed_item(delta_state: &mut DeltaState, item: &ThreadItem) {
-    let key = match item {
-        ThreadItem::AgentMessage(message) => Some(format!("agent:{}", message.id)),
-        ThreadItem::Plan(plan) => Some(format!("plan:{}", plan.id)),
-        _ => None,
+    let Some(key) = state.pending_key.take() else {
+        return Ok(());
     };
-
-    if let Some(key) = key {
-        delta_state.item_text.remove(&key);
-        delta_state.ready_items.remove(&key);
+    let Some(item) = state.pending_item.take() else {
+        return Ok(());
+    };
+    let Some(text) = completed_text_from_item(&item) else {
+        return Ok(());
+    };
+    if state.sent_keys.insert(key) {
+        sink.send(TurnOutput::Markdown(text)).await?;
     }
-}
-
-fn build_delta_item(prefix: &str, item_id: String, text: String) -> Option<ThreadItem> {
-    if text.trim().is_empty() {
-        return None;
-    }
-
-    match prefix {
-        "agent" => Some(ThreadItem::AgentMessage(AgentMessageItem {
-            id: item_id,
-            text,
-            phase: None,
-        })),
-        "plan" => Some(ThreadItem::Plan(codex_app_server_sdk::api::PlanItem {
-            id: item_id,
-            text,
-        })),
-        _ => None,
-    }
+    Ok(())
 }
 
 fn parse_live_item(payload: &ItemLifecycleNotification) -> Option<ThreadItem> {
@@ -959,6 +903,8 @@ fn parse_agent_message_phase_local(value: &str) -> AgentMessagePhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_sdk::protocol::notifications::DeltaNotification;
+    use serde_json::json;
 
     fn message(id: &str, text: &str, phase: Option<AgentMessagePhase>) -> ThreadItem {
         ThreadItem::AgentMessage(AgentMessageItem {
@@ -969,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_only_new_agent_text() {
+    fn streams_only_new_forwardable_agent_text() {
         let mut sent = HashMap::new();
 
         assert_eq!(
@@ -1045,11 +991,34 @@ mod tests {
         );
         assert_eq!(
             next_text_chunk(
-                &message("msg-1", "hidden", Some(AgentMessagePhase::Unknown)),
+                &message("msg-1", "hidden", Some(AgentMessagePhase::Commentary)),
                 &mut sent
-            )
-            .as_deref(),
-            Some("hidden")
+            ),
+            Some("hidden".to_string())
+        );
+        assert_eq!(
+            next_text_chunk(
+                &message("msg-2", "hidden", Some(AgentMessagePhase::Unknown)),
+                &mut sent
+            ),
+            Some("hidden".to_string())
+        );
+        assert_eq!(
+            next_text_chunk(&message("msg-3", "hidden", None), &mut sent),
+            Some("hidden".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_empty_messages() {
+        let mut sent = HashMap::new();
+
+        assert_eq!(
+            next_text_chunk(
+                &message("msg-2", "", Some(AgentMessagePhase::FinalAnswer)),
+                &mut sent
+            ),
+            None
         );
     }
 
@@ -1088,6 +1057,289 @@ mod tests {
             Some(PathBuf::from("/tmp/output.png"))
         );
         assert_eq!(next_image_path(&image, &mut sent), None);
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        outputs: Vec<TurnOutput>,
+    }
+
+    #[async_trait]
+    impl OutputSink for RecordingSink {
+        async fn send(&mut self, output: TurnOutput) -> Result<()> {
+            self.outputs.push(output);
+            Ok(())
+        }
+    }
+
+    fn live_extra(thread_id: &str, turn_id: &str) -> Map<String, Value> {
+        let mut extra = Map::new();
+        extra.insert("threadId".to_string(), Value::String(thread_id.to_string()));
+        extra.insert("turnId".to_string(), Value::String(turn_id.to_string()));
+        extra
+    }
+
+    fn agent_message_delta(
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        delta: &str,
+    ) -> DeltaNotification {
+        DeltaNotification {
+            item_id: Some(item_id.to_string()),
+            delta: Some(delta.to_string()),
+            text: None,
+            summary_index: None,
+            extra: live_extra(thread_id, turn_id),
+        }
+    }
+
+    fn completed_agent_message(
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        phase: &str,
+        text: &str,
+    ) -> ItemLifecycleNotification {
+        ItemLifecycleNotification {
+            item: json!({
+                "id": item_id,
+                "type": "agentMessage",
+                "phase": phase,
+                "text": text,
+            }),
+            extra: live_extra(thread_id, turn_id),
+        }
+    }
+
+    fn completed_plan(
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        text: &str,
+    ) -> ItemLifecycleNotification {
+        ItemLifecycleNotification {
+            item: json!({
+                "id": item_id,
+                "type": "plan",
+                "text": text,
+            }),
+            extra: live_extra(thread_id, turn_id),
+        }
+    }
+
+    fn completed_turn(thread_id: &str, turn_id: &str) -> ServerNotification {
+        ServerNotification::TurnCompleted(
+            codex_app_server_sdk::protocol::notifications::TurnCompletedNotification {
+                turn: codex_app_server_sdk::protocol::responses::Turn {
+                    id: turn_id.to_string(),
+                    status: Some("completed".to_string()),
+                    items: Vec::new(),
+                    error: None,
+                    extra: live_extra(thread_id, turn_id),
+                },
+                extra: Map::new(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn forwards_completed_intermediate_and_final_messages_but_not_deltas_or_plans()
+    -> Result<()> {
+        let mut text_state = LiveTextState::default();
+        let mut sent_images = HashSet::new();
+        let mut sink = RecordingSink::default();
+
+        handle_live_notification(
+            ServerNotification::ItemAgentMessageDelta(agent_message_delta(
+                "thread-1",
+                "turn-1",
+                "msg-1",
+                "Проверю ~/Downloads",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        handle_live_notification(
+            ServerNotification::ItemAgentMessageDelta(agent_message_delta(
+                "thread-1",
+                "turn-1",
+                "msg-1",
+                ", выберу файл",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        assert!(sink.outputs.is_empty(), "delta chunks must stay internal");
+
+        handle_live_notification(
+            ServerNotification::ItemPlanDelta(agent_message_delta(
+                "thread-1",
+                "turn-1",
+                "plan-1",
+                "1. Найти файл",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        assert!(
+            sink.outputs.is_empty(),
+            "plan deltas must stay internal too"
+        );
+
+        handle_live_notification(
+            ServerNotification::ItemCompleted(completed_agent_message(
+                "thread-1",
+                "turn-1",
+                "msg-1",
+                "commentary",
+                "Запрашиваю тек",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        handle_live_notification(
+            ServerNotification::ItemCompleted(completed_agent_message(
+                "thread-1",
+                "turn-1",
+                "msg-1",
+                "commentary",
+                "Запрашиваю текущее систем",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        handle_live_notification(
+            ServerNotification::ItemCompleted(completed_agent_message(
+                "thread-1",
+                "turn-1",
+                "msg-1",
+                "commentary",
+                "Запрашиваю текущее системное время",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        assert!(
+            sink.outputs.is_empty(),
+            "same-item commentary snapshots stay buffered until another completed item arrives"
+        );
+
+        handle_live_notification(
+            ServerNotification::ItemCompleted(completed_plan(
+                "thread-1",
+                "turn-1",
+                "plan-1",
+                "1. Найти файл",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        assert_eq!(sink.outputs.len(), 1);
+        assert!(matches!(
+            sink.outputs.first(),
+            Some(TurnOutput::Markdown(text)) if text == "Запрашиваю текущее системное время"
+        ));
+
+        handle_live_notification(
+            ServerNotification::ItemCompleted(completed_agent_message(
+                "thread-1",
+                "turn-1",
+                "msg-2",
+                "commentary",
+                "Промежуточное сообщение",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        assert_eq!(sink.outputs.len(), 1);
+
+        handle_live_notification(
+            ServerNotification::ItemCompleted(completed_agent_message(
+                "thread-1",
+                "turn-1",
+                "msg-3",
+                "final_answer",
+                "Готовый финальный ответ",
+            )),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        assert!(
+            sink.outputs.len() == 2,
+            "final answer arrival should flush the previous intermediate message and buffer the final one"
+        );
+
+        handle_live_notification(
+            completed_turn("thread-1", "turn-1"),
+            "thread-1",
+            "turn-1",
+            &mut text_state,
+            &mut sent_images,
+            &mut sink,
+        )
+        .await?;
+
+        assert_eq!(sink.outputs.len(), 3);
+        assert!(matches!(
+            sink.outputs.first(),
+            Some(TurnOutput::Markdown(text)) if text == "Запрашиваю текущее системное время"
+        ));
+        assert!(matches!(
+            sink.outputs.get(1),
+            Some(TurnOutput::Markdown(text)) if text == "Промежуточное сообщение"
+        ));
+        assert!(matches!(
+            sink.outputs.get(2),
+            Some(TurnOutput::Markdown(text)) if text == "Готовый финальный ответ"
+        ));
+
+        Ok(())
     }
 
     struct FakeLiveThread {
