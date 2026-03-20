@@ -1,0 +1,22 @@
+[package]
+name = "codexclaw"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+codex-app-server-sdk = "0.5.1"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
