@@ -316,14 +316,6 @@ mod tests {
                 .any(|text| text.contains("Second intermediate"))
         );
         assert!(messages.iter().any(|text| text.contains("Final answer")));
-
-        let reply_markup = requests
-            .iter()
-            .find(|request| request.path.ends_with("/sendMessage"))
-            .and_then(|request| serde_json::from_slice::<Value>(&request.body).ok())
-            .and_then(|value| value.get("reply_markup").cloned())
-            .expect("reply_markup");
-        assert_eq!(reply_markup["keyboard"][0][0]["text"], "New");
         Ok(())
     }
 
@@ -356,7 +348,7 @@ mod tests {
         let mock = start_mock_telegram_api().await?;
         let tempdir = TempDir::new()?;
         let config = test_config(tempdir.path(), &mock.base_url);
-        let update = sample_update_with_text("New");
+        let update = sample_update_with_text("/new");
         let inbound = normalize_update(&update, &[42]).expect("inbound");
         let runner = ResettableRunner::default();
 
