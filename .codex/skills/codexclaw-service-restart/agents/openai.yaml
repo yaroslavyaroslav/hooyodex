@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodexClaw Restart"
+  short_description: "Restart and verify CodexClaw service"
+  default_prompt: "Use $codexclaw-service-restart to restart CodexClaw and verify the active launchd job and health checks."
