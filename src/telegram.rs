@@ -34,8 +34,6 @@ pub struct TelegramMessage {
 #[derive(Debug, Deserialize, Clone)]
 pub struct TelegramChat {
     pub id: i64,
-    #[serde(rename = "type")]
-    pub kind: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -96,9 +94,14 @@ pub enum DownloadedAttachment {
 
 impl InboundMessage {
     pub fn requests_new_chat(&self) -> bool {
+        let Some(text) = self.text.as_deref() else {
+            return false;
+        };
+
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
         matches!(
-            self.text.as_deref().map(str::trim),
-            Some(text) if text.eq_ignore_ascii_case("/new")
+            normalized.to_lowercase().as_str(),
+            "/new" | "new thread" | "новый тред"
         )
     }
 }
@@ -158,11 +161,7 @@ pub fn normalize_update(update: &TelegramUpdate, allowed_users: &[i64]) -> Optio
         sender_id,
         sender_name,
         message_id: message.message_id,
-        thread_id: if message.chat.kind == "private" {
-            None
-        } else {
-            message.message_thread_id
-        },
+        thread_id: message.message_thread_id,
         text: message.text.clone().or_else(|| message.caption.clone()),
         image_file_id,
         document_file_id,
@@ -218,6 +217,7 @@ pub async fn send_markdown_message(
     config: &AppConfig,
     chat_id: i64,
     thread_id: Option<i64>,
+    disable_notification: bool,
     markdown: &str,
 ) -> Result<()> {
     let client = Client::new();
@@ -232,6 +232,7 @@ pub async fn send_markdown_message(
             "chat_id": chat_id,
             "text": chunk,
             "parse_mode": "HTML",
+            "disable_notification": disable_notification,
         });
         if let Some(thread_id) = thread_id {
             body["message_thread_id"] = json!(thread_id);
@@ -409,10 +410,7 @@ mod tests {
     fn sample_message() -> TelegramMessage {
         TelegramMessage {
             message_id: 10,
-            chat: TelegramChat {
-                id: 100,
-                kind: "private".to_string(),
-            },
+            chat: TelegramChat { id: 100 },
             from: Some(TelegramUser {
                 id: 42,
                 first_name: Some("Test".to_string()),
@@ -494,5 +492,32 @@ mod tests {
         )
         .expect("command inbound");
         assert!(command_inbound.requests_new_chat());
+
+        let mut russian_command_message = sample_message();
+        russian_command_message.text = Some("  Новый   Тред  ".to_string());
+        let russian_command_inbound = normalize_update(
+            &TelegramUpdate {
+                update_id: 3,
+                message: Some(russian_command_message),
+                edited_message: None,
+            },
+            &[42],
+        )
+        .expect("russian command inbound");
+        assert!(russian_command_inbound.requests_new_chat());
+    }
+
+    #[test]
+    fn normalize_update_keeps_private_message_thread_id() {
+        let mut message = sample_message();
+        message.message_thread_id = Some(777);
+        let update = TelegramUpdate {
+            update_id: 1,
+            message: Some(message),
+            edited_message: None,
+        };
+
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        assert_eq!(inbound.thread_id, Some(777));
     }
 }

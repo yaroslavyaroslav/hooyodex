@@ -38,7 +38,10 @@ pub struct SessionManager {
 
 #[derive(Debug, Clone)]
 pub enum TurnOutput {
-    Markdown(String),
+    Markdown {
+        text: String,
+        disable_notification: bool,
+    },
     Image(PathBuf),
 }
 
@@ -215,7 +218,7 @@ impl SessionManager {
         attachment: Option<DownloadedAttachment>,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
-        let key = inbound.chat_id.to_string();
+        let key = chat_session_key(&inbound);
         let input = self.build_input(&inbound, attachment);
 
         if self.try_steer_active_turn(&key, &input).await? {
@@ -353,7 +356,7 @@ impl SessionManager {
     }
 
     pub async fn reset_chat_thread(&self, inbound: &InboundMessage) -> Result<()> {
-        let key = inbound.chat_id.to_string();
+        let key = chat_session_key(inbound);
         let session = Arc::new(Mutex::new(
             self.runtime.codex.start_thread(self.base_thread_options()),
         ));
@@ -611,6 +614,13 @@ impl SessionManager {
             collaboration_mode: None,
             extra,
         }
+    }
+}
+
+fn chat_session_key(inbound: &InboundMessage) -> String {
+    match inbound.thread_id {
+        Some(thread_id) => format!("{}:{thread_id}", inbound.chat_id),
+        None => inbound.chat_id.to_string(),
     }
 }
 
@@ -1057,9 +1067,23 @@ async fn flush_completed_text_item(
         return Ok(());
     };
     if state.sent_keys.insert(key) {
-        sink.send(TurnOutput::Markdown(text)).await?;
+        sink.send(TurnOutput::Markdown {
+            disable_notification: matches_agent_commentary(&item),
+            text,
+        })
+        .await?;
     }
     Ok(())
+}
+
+fn matches_agent_commentary(item: &ThreadItem) -> bool {
+    matches!(
+        item,
+        ThreadItem::AgentMessage(AgentMessageItem {
+            phase: Some(AgentMessagePhase::Commentary),
+            ..
+        })
+    )
 }
 
 fn parse_live_item(payload: &ItemLifecycleNotification) -> Option<ThreadItem> {
@@ -1498,7 +1522,10 @@ mod tests {
         assert_eq!(sink.outputs.len(), 1);
         assert!(matches!(
             sink.outputs.first(),
-            Some(TurnOutput::Markdown(text)) if text == "Запрашиваю текущее системное время"
+            Some(TurnOutput::Markdown {
+                text,
+                disable_notification: true,
+            }) if text == "Запрашиваю текущее системное время"
         ));
 
         handle_live_notification(
@@ -1553,15 +1580,24 @@ mod tests {
         assert_eq!(sink.outputs.len(), 3);
         assert!(matches!(
             sink.outputs.first(),
-            Some(TurnOutput::Markdown(text)) if text == "Запрашиваю текущее системное время"
+            Some(TurnOutput::Markdown {
+                text,
+                disable_notification: true,
+            }) if text == "Запрашиваю текущее системное время"
         ));
         assert!(matches!(
             sink.outputs.get(1),
-            Some(TurnOutput::Markdown(text)) if text == "Промежуточное сообщение"
+            Some(TurnOutput::Markdown {
+                text,
+                disable_notification: true,
+            }) if text == "Промежуточное сообщение"
         ));
         assert!(matches!(
             sink.outputs.get(2),
-            Some(TurnOutput::Markdown(text)) if text == "Готовый финальный ответ"
+            Some(TurnOutput::Markdown {
+                text,
+                disable_notification: false,
+            }) if text == "Готовый финальный ответ"
         ));
 
         Ok(())
@@ -1603,7 +1639,10 @@ mod tests {
         assert_eq!(sink.outputs.len(), 1);
         assert!(matches!(
             sink.outputs.first(),
-            Some(TurnOutput::Markdown(text)) if text == "Checking the external source now"
+            Some(TurnOutput::Markdown {
+                text,
+                disable_notification: true,
+            }) if text == "Checking the external source now"
         ));
 
         Ok(())
@@ -1734,5 +1773,27 @@ mod tests {
             "thread-1",
             "turn-1"
         ));
+    }
+
+    #[test]
+    fn chat_session_key_includes_telegram_thread_context() {
+        let inbound = InboundMessage {
+            chat_id: 42,
+            sender_id: 7,
+            sender_name: "User".to_string(),
+            message_id: 10,
+            thread_id: Some(9001),
+            text: Some("hello".to_string()),
+            image_file_id: None,
+            document_file_id: None,
+            document_name: None,
+            voice_file_id: None,
+            voice_duration: None,
+        };
+        assert_eq!(chat_session_key(&inbound), "42:9001");
+
+        let mut root_inbound = inbound;
+        root_inbound.thread_id = None;
+        assert_eq!(chat_session_key(&root_inbound), "42");
     }
 }

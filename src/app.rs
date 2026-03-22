@@ -100,6 +100,7 @@ async fn process_telegram_update(
             config,
             inbound.chat_id,
             inbound.thread_id,
+            false,
             "Started a fresh chat. History cleared for this Telegram chat.",
         )
         .await?;
@@ -119,6 +120,7 @@ async fn process_telegram_update(
                 config,
                 inbound.chat_id,
                 inbound.thread_id,
+                false,
                 &format!("Attachment download failed:\n\n```text\n{error}\n```"),
             )
             .await;
@@ -138,6 +140,7 @@ async fn process_telegram_update(
                 config,
                 inbound.chat_id,
                 inbound.thread_id,
+                false,
                 &format!("Voice transcription failed:\n\n```text\n{error}\n```"),
             )
             .await;
@@ -162,6 +165,7 @@ async fn process_telegram_update(
                 config,
                 chat_id,
                 thread_id,
+                false,
                 &format!("Turn failed:\n\n```text\n{error}\n```"),
             )
             .await;
@@ -226,8 +230,18 @@ struct TelegramSink {
 impl OutputSink for TelegramSink {
     async fn send(&mut self, output: TurnOutput) -> Result<()> {
         match output {
-            TurnOutput::Markdown(markdown) => {
-                send_markdown_message(&self.config, self.chat_id, self.thread_id, &markdown).await
+            TurnOutput::Markdown {
+                text,
+                disable_notification,
+            } => {
+                send_markdown_message(
+                    &self.config,
+                    self.chat_id,
+                    self.thread_id,
+                    disable_notification,
+                    &text,
+                )
+                .await
             }
             TurnOutput::Image(path) => {
                 send_photo(&self.config, self.chat_id, self.thread_id, &path, None).await
@@ -318,6 +332,8 @@ mod tests {
         body: Vec<u8>,
     }
 
+    type ResetCalls = Arc<Mutex<Vec<(i64, Option<i64>)>>>;
+
     #[derive(Clone, Default)]
     struct MockTelegramState {
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -379,36 +395,85 @@ mod tests {
         let inbound = normalize_update(&update, &[42]).expect("inbound");
         let runner = FakeTurnRunner {
             scripted_outputs: vec![
-                TurnOutput::Markdown("First intermediate".to_string()),
-                TurnOutput::Markdown("Second intermediate".to_string()),
-                TurnOutput::Markdown("Final answer".to_string()),
+                TurnOutput::Markdown {
+                    text: "First intermediate".to_string(),
+                    disable_notification: true,
+                },
+                TurnOutput::Markdown {
+                    text: "Second intermediate".to_string(),
+                    disable_notification: true,
+                },
+                TurnOutput::Markdown {
+                    text: "Final answer".to_string(),
+                    disable_notification: false,
+                },
             ],
         };
 
         process_telegram_update(&runner, &config, update, inbound).await?;
 
         let requests = mock.requests().await;
-        let messages: Vec<String> = requests
+        let messages: Vec<Value> = requests
             .iter()
             .filter(|request| request.path.ends_with("/sendMessage"))
-            .map(|request| {
-                let value: Value = serde_json::from_slice(&request.body).expect("sendMessage json");
-                value["text"].as_str().unwrap_or_default().to_string()
-            })
+            .map(|request| serde_json::from_slice(&request.body).expect("sendMessage json"))
             .collect();
 
         assert_eq!(messages.len(), 3);
-        assert!(
+        assert!(messages.iter().any(|body| {
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("First intermediate")
+        }));
+        assert!(messages.iter().any(|body| {
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Second intermediate")
+        }));
+        assert!(messages.iter().any(|body| {
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Final answer")
+        }));
+        assert_eq!(
             messages
                 .iter()
-                .any(|text| text.contains("First intermediate"))
+                .map(|body| body["disable_notification"].as_bool())
+                .collect::<Vec<_>>(),
+            vec![Some(true), Some(true), Some(false)]
         );
-        assert!(
-            messages
-                .iter()
-                .any(|text| text.contains("Second intermediate"))
-        );
-        assert!(messages.iter().any(|text| text.contains("Final answer")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_replies_inside_same_telegram_thread() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let update = sample_group_thread_update_with_text("hello", 777);
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        let runner = FakeTurnRunner {
+            scripted_outputs: vec![TurnOutput::Markdown {
+                text: "Threaded reply".to_string(),
+                disable_notification: true,
+            }],
+        };
+
+        process_telegram_update(&runner, &config, update, inbound).await?;
+
+        let requests = mock.requests().await;
+        let send_message: Value = requests
+            .iter()
+            .find(|request| request.path.ends_with("/sendMessage"))
+            .map(|request| serde_json::from_slice(&request.body).expect("sendMessage json"))
+            .expect("sendMessage request");
+
+        assert_eq!(send_message["message_thread_id"].as_i64(), Some(777));
+        assert_eq!(send_message["text"].as_str(), Some("Threaded reply"));
+        assert_eq!(send_message["disable_notification"].as_bool(), Some(true));
         Ok(())
     }
 
@@ -416,14 +481,17 @@ mod tests {
     async fn process_update_resets_chat_on_new_command() -> Result<()> {
         #[derive(Default)]
         struct ResettableRunner {
-            resets: Arc<Mutex<Vec<i64>>>,
+            resets: ResetCalls,
             turns: Arc<Mutex<u32>>,
         }
 
         #[async_trait::async_trait]
         impl ChatTurnRunner for ResettableRunner {
             async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()> {
-                self.resets.lock().await.push(inbound.chat_id);
+                self.resets
+                    .lock()
+                    .await
+                    .push((inbound.chat_id, inbound.thread_id));
                 Ok(())
             }
 
@@ -441,26 +509,109 @@ mod tests {
         let mock = start_mock_telegram_api().await?;
         let tempdir = TempDir::new()?;
         let config = test_config(tempdir.path(), &mock.base_url);
-        let update = sample_update_with_text("/new");
+        let update = sample_group_thread_update_with_text("новый тред", 777);
         let inbound = normalize_update(&update, &[42]).expect("inbound");
         let runner = ResettableRunner::default();
 
         process_telegram_update(&runner, &config, update, inbound).await?;
 
-        assert_eq!(runner.resets.lock().await.as_slice(), &[100]);
+        assert_eq!(runner.resets.lock().await.as_slice(), &[(100, Some(777))]);
         assert_eq!(*runner.turns.lock().await, 0);
 
         let requests = mock.requests().await;
-        let messages: Vec<String> = requests
+        let responses: Vec<Value> = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/sendMessage"))
+            .map(|request| serde_json::from_slice(&request.body).expect("sendMessage json"))
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["message_thread_id"].as_i64(), Some(777));
+        assert!(
+            responses[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("fresh chat")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_resets_only_current_telegram_thread() -> Result<()> {
+        #[derive(Default)]
+        struct ResettableRunner {
+            resets: ResetCalls,
+        }
+
+        #[async_trait::async_trait]
+        impl ChatTurnRunner for ResettableRunner {
+            async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()> {
+                self.resets
+                    .lock()
+                    .await
+                    .push((inbound.chat_id, inbound.thread_id));
+                Ok(())
+            }
+
+            async fn run_chat_turn(
+                &self,
+                _inbound: InboundMessage,
+                _attachment: Option<DownloadedAttachment>,
+                _sink: &mut dyn OutputSink,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let mut update = sample_update_with_text("новый тред");
+        update.message.as_mut().expect("message").message_thread_id = Some(321);
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        let runner = ResettableRunner::default();
+
+        process_telegram_update(&runner, &config, update, inbound).await?;
+
+        assert_eq!(runner.resets.lock().await.as_slice(), &[(100, Some(321))]);
+
+        let requests = mock.requests().await;
+        let thread_ids: Vec<Option<i64>> = requests
             .iter()
             .filter(|request| request.path.ends_with("/sendMessage"))
             .map(|request| {
                 let value: Value = serde_json::from_slice(&request.body).expect("sendMessage json");
-                value["text"].as_str().unwrap_or_default().to_string()
+                value.get("message_thread_id").and_then(Value::as_i64)
             })
             .collect();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("fresh chat"));
+        assert_eq!(thread_ids, vec![Some(321)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_replies_into_private_message_thread() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let mut update = sample_update();
+        update.message.as_mut().expect("message").message_thread_id = Some(777);
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        let runner = FakeTurnRunner {
+            scripted_outputs: vec![TurnOutput::Markdown {
+                text: "Reply in thread".to_string(),
+                disable_notification: true,
+            }],
+        };
+
+        process_telegram_update(&runner, &config, update, inbound).await?;
+
+        let requests = mock.requests().await;
+        let send_message = requests
+            .iter()
+            .find(|request| request.path.ends_with("/sendMessage"))
+            .expect("sendMessage request");
+        let value: Value = serde_json::from_slice(&send_message.body).expect("sendMessage json");
+        assert_eq!(value["message_thread_id"].as_i64(), Some(777));
+        assert_eq!(value["disable_notification"].as_bool(), Some(true));
         Ok(())
     }
 
@@ -639,10 +790,7 @@ mod tests {
             update_id: 2,
             message: Some(TelegramMessage {
                 message_id: 11,
-                chat: TelegramChat {
-                    id: 100,
-                    kind: "private".to_string(),
-                },
+                chat: TelegramChat { id: 100 },
                 from: Some(TelegramUser {
                     id: 42,
                     first_name: Some("Test".to_string()),
@@ -699,10 +847,7 @@ mod tests {
             update_id: 1,
             message: Some(TelegramMessage {
                 message_id: 10,
-                chat: TelegramChat {
-                    id: 100,
-                    kind: "private".to_string(),
-                },
+                chat: TelegramChat { id: 100 },
                 from: Some(TelegramUser {
                     id: 42,
                     first_name: Some("Test".to_string()),
@@ -715,6 +860,29 @@ mod tests {
                 document: None,
                 voice: None,
                 message_thread_id: None,
+            }),
+            edited_message: None,
+        }
+    }
+
+    fn sample_group_thread_update_with_text(text: &str, thread_id: i64) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id: 3,
+            message: Some(TelegramMessage {
+                message_id: 12,
+                chat: TelegramChat { id: 100 },
+                from: Some(TelegramUser {
+                    id: 42,
+                    first_name: Some("Test".to_string()),
+                    last_name: None,
+                }),
+                sender_chat: None,
+                text: Some(text.to_string()),
+                caption: None,
+                photo: None,
+                document: None,
+                voice: None,
+                message_thread_id: Some(thread_id),
             }),
             edited_message: None,
         }
