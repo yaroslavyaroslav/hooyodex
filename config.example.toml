@@ -18,7 +18,7 @@ connect_url = "ws://127.0.0.1:4222"
 listen_url = "ws://127.0.0.1:4222"
 reuse_existing_server = true
 working_directory = "."
-model = "gpt-5-codex"
+model = "gpt-5.4"
 additional_directories = [
   "../openfang",
   "../../git/codex",
