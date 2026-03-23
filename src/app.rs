@@ -682,18 +682,44 @@ mod tests {
             })
             .collect();
 
-        let transcript = messages.join("\n---\n");
         assert!(
-            messages.iter().any(|message| message.contains("STEP_ONE")),
-            "expected a streamed Telegram message containing STEP_ONE, got:\n{transcript}"
+            messages.len() >= 3,
+            "expected at least three Telegram messages (two commentary + final), got {:?}",
+            messages
         );
+
+        let step_one_index = messages
+            .iter()
+            .position(|message| message.trim() == "STEP_ONE")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected STEP_ONE as its own message, transcript:\n{}",
+                    messages.join("\n---\n")
+                )
+            });
+        let step_two_index = messages
+            .iter()
+            .position(|message| message.trim() == "STEP_TWO")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected STEP_TWO as its own message, transcript:\n{}",
+                    messages.join("\n---\n")
+                )
+            });
+        let done_index = messages
+            .iter()
+            .position(|message| message.trim() == "DONE")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected DONE as its own message, transcript:\n{}",
+                    messages.join("\n---\n")
+                )
+            });
+
         assert!(
-            messages.iter().any(|message| message.contains("STEP_TWO")),
-            "expected a streamed Telegram message containing STEP_TWO, got:\n{transcript}"
-        );
-        assert!(
-            messages.iter().any(|message| message.contains("DONE")),
-            "expected a final Telegram message containing DONE, got:\n{transcript}"
+            step_one_index < step_two_index && step_two_index < done_index,
+            "expected STEP_ONE -> STEP_TWO -> DONE order, got transcript:\n{}",
+            messages.join("\n---\n")
         );
         Ok(())
     }
@@ -724,24 +750,30 @@ mod tests {
             })
             .collect();
 
-        let transcript = messages.join("\n---\n");
-        assert!(
-            !messages.is_empty(),
-            "expected at least one Telegram message, got none"
+        assert_eq!(
+            messages.len(),
+            3,
+            "expected exactly three Telegram messages (STEP_ONE, STEP_TWO, final), got {:?}",
+            messages
+        );
+        assert_eq!(
+            messages[0].trim(),
+            "STEP_ONE",
+            "expected first message to be STEP_ONE, transcript:\n{}",
+            messages.join("\n---\n")
+        );
+        assert_eq!(
+            messages[1].trim(),
+            "STEP_TWO",
+            "expected second message to be STEP_TWO, transcript:\n{}",
+            messages.join("\n---\n")
         );
         assert!(
-            messages.iter().any(|message| message.contains("STEP_ONE")),
-            "expected an intermediate Telegram message containing STEP_ONE, got:\n{transcript}"
-        );
-        assert!(
-            messages.iter().any(|message| message.contains("STEP_TWO")),
-            "expected an intermediate Telegram message containing STEP_TWO, got:\n{transcript}"
-        );
-        assert!(
-            !messages
-                .iter()
-                .any(|message| message == "через" || message == "внешний" || message == "источник"),
-            "expected no tiny delta fragments, got:\n{transcript}"
+            !messages[2].contains("STEP_ONE")
+                && !messages[2].contains("STEP_TWO")
+                && !messages[2].trim().is_empty(),
+            "expected a standalone final answer, got transcript:\n{}",
+            messages.join("\n---\n")
         );
         Ok(())
     }

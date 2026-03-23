@@ -831,6 +831,7 @@ async fn handle_live_notification(
                 }
                 if let Some(key) = live_text_item_key(&item) {
                     queue_completed_text_item(text_state, key, item, sink).await?;
+                    flush_completed_text_item(text_state, sink).await?;
                 } else {
                     flush_completed_text_item(text_state, sink).await?;
                 }
@@ -1377,21 +1378,6 @@ mod tests {
         }
     }
 
-    fn completed_turn(thread_id: &str, turn_id: &str) -> ServerNotification {
-        ServerNotification::TurnCompleted(
-            codex_app_server_sdk::protocol::notifications::TurnCompletedNotification {
-                turn: codex_app_server_sdk::protocol::responses::Turn {
-                    id: turn_id.to_string(),
-                    status: Some("completed".to_string()),
-                    items: Vec::new(),
-                    error: None,
-                    extra: live_extra(thread_id, turn_id),
-                },
-                extra: Map::new(),
-            },
-        )
-    }
-
     #[tokio::test]
     async fn forwards_completed_intermediate_and_final_messages_but_not_deltas_or_plans()
     -> Result<()> {
@@ -1404,7 +1390,7 @@ mod tests {
                 "thread-1",
                 "turn-1",
                 "msg-1",
-                "Проверю ~/Downloads",
+                "Проверяю состояние",
             )),
             "thread-1",
             "turn-1",
@@ -1413,23 +1399,6 @@ mod tests {
             &mut sink,
         )
         .await?;
-
-        handle_live_notification(
-            ServerNotification::ItemAgentMessageDelta(agent_message_delta(
-                "thread-1",
-                "turn-1",
-                "msg-1",
-                ", выберу файл",
-            )),
-            "thread-1",
-            "turn-1",
-            &mut text_state,
-            &mut sent_images,
-            &mut sink,
-        )
-        .await?;
-
-        assert!(sink.outputs.is_empty(), "delta chunks must stay internal");
 
         handle_live_notification(
             ServerNotification::ItemPlanDelta(agent_message_delta(
@@ -1457,7 +1426,7 @@ mod tests {
                 "turn-1",
                 "msg-1",
                 "commentary",
-                "Запрашиваю тек",
+                "Отправляю STEP_ONE",
             )),
             "thread-1",
             "turn-1",
@@ -1466,14 +1435,23 @@ mod tests {
             &mut sink,
         )
         .await?;
+
+        assert_eq!(sink.outputs.len(), 1);
+        assert!(matches!(
+            sink.outputs.first(),
+            Some(TurnOutput::Markdown {
+                text,
+                disable_notification: true,
+            }) if text == "Отправляю STEP_ONE"
+        ));
 
         handle_live_notification(
             ServerNotification::ItemCompleted(completed_agent_message(
                 "thread-1",
                 "turn-1",
-                "msg-1",
+                "msg-2",
                 "commentary",
-                "Запрашиваю текущее систем",
+                "Отправляю STEP_TWO",
             )),
             "thread-1",
             "turn-1",
@@ -1483,26 +1461,14 @@ mod tests {
         )
         .await?;
 
-        handle_live_notification(
-            ServerNotification::ItemCompleted(completed_agent_message(
-                "thread-1",
-                "turn-1",
-                "msg-1",
-                "commentary",
-                "Запрашиваю текущее системное время",
-            )),
-            "thread-1",
-            "turn-1",
-            &mut text_state,
-            &mut sent_images,
-            &mut sink,
-        )
-        .await?;
-
-        assert!(
-            sink.outputs.is_empty(),
-            "same-item commentary snapshots stay buffered until another completed item arrives"
-        );
+        assert_eq!(sink.outputs.len(), 2);
+        assert!(matches!(
+            sink.outputs.get(1),
+            Some(TurnOutput::Markdown {
+                text,
+                disable_notification: true,
+            }) if text == "Отправляю STEP_TWO"
+        ));
 
         handle_live_notification(
             ServerNotification::ItemCompleted(completed_plan(
@@ -1519,32 +1485,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(sink.outputs.len(), 1);
-        assert!(matches!(
-            sink.outputs.first(),
-            Some(TurnOutput::Markdown {
-                text,
-                disable_notification: true,
-            }) if text == "Запрашиваю текущее системное время"
-        ));
-
-        handle_live_notification(
-            ServerNotification::ItemCompleted(completed_agent_message(
-                "thread-1",
-                "turn-1",
-                "msg-2",
-                "commentary",
-                "Промежуточное сообщение",
-            )),
-            "thread-1",
-            "turn-1",
-            &mut text_state,
-            &mut sent_images,
-            &mut sink,
-        )
-        .await?;
-
-        assert_eq!(sink.outputs.len(), 1);
+        assert_eq!(
+            sink.outputs.len(),
+            2,
+            "non-agent completions must not emit extra Telegram messages"
+        );
 
         handle_live_notification(
             ServerNotification::ItemCompleted(completed_agent_message(
@@ -1562,36 +1507,7 @@ mod tests {
         )
         .await?;
 
-        assert!(
-            sink.outputs.len() == 2,
-            "final answer arrival should flush the previous intermediate message and buffer the final one"
-        );
-
-        handle_live_notification(
-            completed_turn("thread-1", "turn-1"),
-            "thread-1",
-            "turn-1",
-            &mut text_state,
-            &mut sent_images,
-            &mut sink,
-        )
-        .await?;
-
         assert_eq!(sink.outputs.len(), 3);
-        assert!(matches!(
-            sink.outputs.first(),
-            Some(TurnOutput::Markdown {
-                text,
-                disable_notification: true,
-            }) if text == "Запрашиваю текущее системное время"
-        ));
-        assert!(matches!(
-            sink.outputs.get(1),
-            Some(TurnOutput::Markdown {
-                text,
-                disable_notification: true,
-            }) if text == "Промежуточное сообщение"
-        ));
         assert!(matches!(
             sink.outputs.get(2),
             Some(TurnOutput::Markdown {
@@ -1625,7 +1541,14 @@ mod tests {
         )
         .await?;
 
-        assert!(sink.outputs.is_empty());
+        assert_eq!(sink.outputs.len(), 1);
+        assert!(matches!(
+            sink.outputs.first(),
+            Some(TurnOutput::Markdown {
+                text,
+                disable_notification: true,
+            }) if text == "Checking the external source now"
+        ));
 
         maybe_flush_on_successor_notification(
             &ServerNotification::ItemStarted(started_dynamic_tool_call(
@@ -1636,14 +1559,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(sink.outputs.len(), 1);
-        assert!(matches!(
-            sink.outputs.first(),
-            Some(TurnOutput::Markdown {
-                text,
-                disable_notification: true,
-            }) if text == "Checking the external source now"
-        ));
+        assert_eq!(
+            sink.outputs.len(),
+            1,
+            "successor notifications should not duplicate already flushed commentary"
+        );
 
         Ok(())
     }
