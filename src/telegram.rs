@@ -92,6 +92,16 @@ pub enum DownloadedAttachment {
     },
 }
 
+pub struct OutboundTelegramMedia<'a> {
+    pub chat_id: i64,
+    pub thread_id: Option<i64>,
+    pub path: &'a Path,
+    pub disable_notification: bool,
+    pub caption_html: Option<&'a str>,
+    pub file_name_override: Option<&'a str>,
+    pub mime_type_override: Option<&'a str>,
+}
+
 impl InboundMessage {
     pub fn requests_new_chat(&self) -> bool {
         let Some(text) = self.text.as_deref() else {
@@ -246,41 +256,59 @@ pub async fn send_markdown_message(
     Ok(())
 }
 
-pub async fn send_photo(
+async fn send_media_file(
     config: &AppConfig,
-    chat_id: i64,
-    thread_id: Option<i64>,
-    path: &Path,
-    caption_html: Option<&str>,
+    endpoint: &str,
+    field_name: &str,
+    upload: OutboundTelegramMedia<'_>,
 ) -> Result<()> {
     let client = Client::new();
     let url = format!(
-        "{}/bot{}/sendPhoto",
+        "{}/bot{}/{}",
         config.telegram.api_base_url.trim_end_matches('/'),
-        config.telegram.bot_token
+        config.telegram.bot_token,
+        endpoint
     );
 
-    let bytes = fs::read(path)
+    let bytes = fs::read(upload.path)
         .await
-        .with_context(|| format!("failed to read image {}", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("image.png")
-        .to_string();
+        .with_context(|| format!("failed to read media {}", upload.path.display()))?;
+    let file_name = upload
+        .file_name_override
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            upload
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "attachment.bin".to_string());
 
-    let mut photo = Part::bytes(bytes).file_name(file_name);
-    if let Some(mime) = image_mime_type(path) {
-        photo = photo.mime_str(mime)?;
+    let mut part = Part::bytes(bytes).file_name(file_name);
+    if let Some(mime) = upload
+        .mime_type_override
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| infer_mime_type(field_name, upload.path))
+    {
+        part = part.mime_str(mime)?;
     }
 
     let mut form = Form::new()
-        .text("chat_id", chat_id.to_string())
-        .part("photo", photo);
-    if let Some(thread_id) = thread_id {
+        .text("chat_id", upload.chat_id.to_string())
+        .text(
+            "disable_notification",
+            upload.disable_notification.to_string(),
+        )
+        .part(field_name.to_string(), part);
+    if let Some(thread_id) = upload.thread_id {
         form = form.text("message_thread_id", thread_id.to_string());
     }
-    if let Some(caption_html) = caption_html.filter(|caption| !caption.trim().is_empty()) {
+    if let Some(caption_html) = upload
+        .caption_html
+        .filter(|caption| !caption.trim().is_empty())
+    {
         form = form
             .text("caption", sanitize_telegram_html(caption_html))
             .text("parse_mode", "HTML");
@@ -289,9 +317,25 @@ pub async fn send_photo(
     let response = client.post(&url).multipart(form).send().await?;
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
-        bail!("Telegram sendPhoto failed: {}", text);
+        bail!("Telegram {} failed: {}", endpoint, text);
     }
     Ok(())
+}
+
+pub async fn send_photo(config: &AppConfig, media: OutboundTelegramMedia<'_>) -> Result<()> {
+    send_media_file(config, "sendPhoto", "photo", media).await
+}
+
+pub async fn send_document(config: &AppConfig, media: OutboundTelegramMedia<'_>) -> Result<()> {
+    send_media_file(config, "sendDocument", "document", media).await
+}
+
+pub async fn send_audio(config: &AppConfig, media: OutboundTelegramMedia<'_>) -> Result<()> {
+    send_media_file(config, "sendAudio", "audio", media).await
+}
+
+pub async fn send_voice(config: &AppConfig, media: OutboundTelegramMedia<'_>) -> Result<()> {
+    send_media_file(config, "sendVoice", "voice", media).await
 }
 
 pub async fn download_attachment(
@@ -399,6 +443,14 @@ fn image_mime_type(path: &Path) -> Option<&'static str> {
         Some("png") => Some("image/png"),
         Some("jpg") | Some("jpeg") => Some("image/jpeg"),
         Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn infer_mime_type(field_name: &str, path: &Path) -> Option<&'static str> {
+    match field_name {
+        "photo" => image_mime_type(path),
+        "voice" => Some("audio/ogg"),
         _ => None,
     }
 }

@@ -1,19 +1,20 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use codex_app_server_sdk::api::{
-    AgentMessageItem, AgentMessagePhase, ApprovalMode, Codex, Input, SandboxMode, Thread,
-    ThreadItem, ThreadOptions, TurnOptions, UserInput, WebSearchMode,
+    AgentMessageItem, AgentMessagePhase, ApprovalMode, Codex, DynamicToolSpec, Input, SandboxMode,
+    Thread, ThreadItem, ThreadOptions, TurnOptions, UserInput, WebSearchMode,
 };
 use codex_app_server_sdk::events::{ServerEvent, ServerNotification};
 use codex_app_server_sdk::protocol::notifications::ItemLifecycleNotification;
-use codex_app_server_sdk::protocol::requests;
-use codex_app_server_sdk::{WsConfig, WsServerHandle, WsStartConfig};
-use serde_json::{Map, Value};
+use codex_app_server_sdk::protocol::{requests, server_requests};
+use codex_app_server_sdk::{ClientError, WsConfig, WsServerHandle, WsStartConfig};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, warn};
 
@@ -24,6 +25,7 @@ use crate::telegram::{DownloadedAttachment, InboundMessage};
 pub struct CodexRuntime {
     pub codex: Codex,
     pub _server: WsServerHandle,
+    tool_router: Arc<DynamicToolRouter>,
 }
 
 pub struct SessionManager {
@@ -42,7 +44,174 @@ pub enum TurnOutput {
         text: String,
         disable_notification: bool,
     },
-    Image(PathBuf),
+    Media {
+        kind: TelegramMediaKind,
+        path: PathBuf,
+        caption_markdown: Option<String>,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        disable_notification: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramMediaKind {
+    Photo,
+    Document,
+    Audio,
+    Voice,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+struct TelegramSendMediaArgs {
+    path: String,
+    kind: TelegramMediaKind,
+    #[serde(default)]
+    caption_markdown: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    disable_notification: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DynamicToolCallEnvelope {
+    tool: String,
+    turn_id: String,
+    arguments: Value,
+}
+
+#[derive(Default)]
+struct DynamicToolRouter {
+    allowed_roots: Vec<PathBuf>,
+    turn_outputs: Mutex<HashMap<String, mpsc::Sender<TurnOutput>>>,
+}
+
+impl DynamicToolRouter {
+    fn new(config: &AppConfig) -> Self {
+        let mut allowed_roots = vec![
+            config.codex.working_directory.clone(),
+            config.attachment_root(),
+        ];
+        allowed_roots.extend(config.codex.additional_directories.iter().cloned());
+        Self {
+            allowed_roots,
+            turn_outputs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn register_turn(&self, turn_id: &str, sender: mpsc::Sender<TurnOutput>) {
+        self.turn_outputs
+            .lock()
+            .await
+            .insert(turn_id.to_string(), sender);
+    }
+
+    async fn unregister_turn(&self, turn_id: &str) {
+        self.turn_outputs.lock().await.remove(turn_id);
+    }
+
+    async fn handle_call(
+        &self,
+        params: server_requests::DynamicToolCallParams,
+    ) -> std::result::Result<server_requests::DynamicToolCallResponse, ClientError> {
+        let envelope = parse_dynamic_tool_call_envelope(&params)?;
+        if envelope.tool != "telegram_send_media" {
+            return Err(ClientError::InvalidMessage(format!(
+                "unsupported dynamic tool `{}`",
+                envelope.tool
+            )));
+        }
+
+        let arguments: TelegramSendMediaArgs = serde_json::from_value(envelope.arguments)?;
+        let display_name = arguments
+            .file_name
+            .as_deref()
+            .unwrap_or_else(|| file_name_or_path(&arguments.path))
+            .to_string();
+        let path = self.resolve_allowed_path(&arguments.path).await?;
+        let output = TurnOutput::Media {
+            kind: arguments.kind,
+            path,
+            caption_markdown: arguments.caption_markdown,
+            file_name: arguments.file_name,
+            mime_type: arguments.mime_type,
+            disable_notification: arguments.disable_notification.unwrap_or(false),
+        };
+
+        let sender = self
+            .turn_outputs
+            .lock()
+            .await
+            .get(&envelope.turn_id)
+            .cloned()
+            .ok_or_else(|| {
+                ClientError::InvalidMessage(format!(
+                    "no active Telegram sink for turn {}",
+                    envelope.turn_id
+                ))
+            })?;
+
+        sender
+            .send(output)
+            .await
+            .map_err(|_| ClientError::TransportClosed)?;
+
+        Ok(server_requests::DynamicToolCallResponse {
+            extra: serde_json::from_value(json!({
+                "success": true,
+                "contentItems": [{
+                    "type": "text",
+                    "text": format!(
+                        "Queued Telegram {} upload for {}.",
+                        media_kind_label(arguments.kind),
+                        display_name
+                    )
+                }]
+            }))?,
+        })
+    }
+
+    async fn resolve_allowed_path(
+        &self,
+        raw_path: &str,
+    ) -> std::result::Result<PathBuf, ClientError> {
+        let candidate = PathBuf::from(raw_path);
+        let canonical_candidate = match tokio::fs::canonicalize(&candidate).await {
+            Ok(path) => path,
+            Err(first_error) if candidate.is_absolute() => {
+                return Err(ClientError::Io(first_error));
+            }
+            Err(_) => {
+                let joined = self
+                    .allowed_roots
+                    .first()
+                    .map(|root| root.join(&candidate))
+                    .ok_or_else(|| {
+                        ClientError::InvalidMessage("no allowed directories configured".to_string())
+                    })?;
+                tokio::fs::canonicalize(joined).await?
+            }
+        };
+
+        for root in &self.allowed_roots {
+            let Ok(canonical_root) = tokio::fs::canonicalize(root).await else {
+                continue;
+            };
+            if canonical_candidate.starts_with(&canonical_root) {
+                return Ok(canonical_candidate);
+            }
+        }
+
+        Err(ClientError::InvalidMessage(format!(
+            "path `{}` is outside allowed directories",
+            canonical_candidate.display()
+        )))
+    }
 }
 
 #[derive(Default)]
@@ -114,9 +283,19 @@ impl CodexRuntime {
         let codex =
             Codex::connect_ws(WsConfig::default().with_url(config.codex.connect_url.clone()))
                 .await?;
+        let tool_router = Arc::new(DynamicToolRouter::new(config));
+        let tool_router_for_handler = tool_router.clone();
+        codex
+            .client()
+            .set_dynamic_tool_call_handler(move |params| {
+                let tool_router = tool_router_for_handler.clone();
+                async move { tool_router.handle_call(params).await }
+            })
+            .await;
         Ok(Self {
             codex,
             _server: server,
+            tool_router,
         })
     }
 }
@@ -234,7 +413,6 @@ impl SessionManager {
         }
 
         let mut text_state = LiveTextState::default();
-        let mut sent_images = HashSet::new();
 
         let thread_id = prepare_live_thread(&mut *thread).await?;
         let active_turn = Arc::new(ActiveChatTurn::new(thread_id.clone()));
@@ -250,6 +428,7 @@ impl SessionManager {
         let client = self.runtime.codex.client();
         let mut server_events = client.subscribe();
         let (tx, mut rx) = mpsc::channel(512);
+        let (tool_output_tx, mut tool_output_rx) = mpsc::channel(32);
 
         let turn_start_tx = tx.clone();
         let active_for_start = active_turn.clone();
@@ -290,17 +469,30 @@ impl SessionManager {
         let mut active_turn_id = None;
         let mut buffered_notifications = Vec::new();
         let stream_result: Result<()> = async {
-            while let Some(event) = rx.recv().await {
+            loop {
+                let event = tokio::select! {
+                    maybe_event = rx.recv() => match maybe_event {
+                        Some(event) => event,
+                        None => break,
+                    },
+                    maybe_output = tool_output_rx.recv() => match maybe_output {
+                        Some(output) => LiveTurnEvent::ToolOutput(output),
+                        None => continue,
+                    },
+                };
                 match event {
                     LiveTurnEvent::TurnStartResult(result) => {
                         let turn_id = result?;
                         active_turn_id = Some(turn_id.clone());
+                        self.runtime
+                            .tool_router
+                            .register_turn(&turn_id, tool_output_tx.clone())
+                            .await;
                         let terminal = replay_buffered_notifications(
                             &buffered_notifications,
                             &thread_id,
                             &turn_id,
                             &mut text_state,
-                            &mut sent_images,
                             sink,
                         )
                         .await?;
@@ -328,7 +520,6 @@ impl SessionManager {
                             &thread_id,
                             turn_id,
                             &mut text_state,
-                            &mut sent_images,
                             sink,
                         )
                         .await?
@@ -336,6 +527,10 @@ impl SessionManager {
                         {
                             break;
                         }
+                    }
+                    LiveTurnEvent::ToolOutput(output) => {
+                        flush_completed_text_item(&mut text_state, sink).await?;
+                        sink.send(output).await?;
                     }
                     LiveTurnEvent::Server(ServerEvent::ServerRequest(_)) => {
                         flush_completed_text_item(&mut text_state, sink).await?;
@@ -350,6 +545,9 @@ impl SessionManager {
         }
         .await;
 
+        if let Some(turn_id) = active_turn_id.as_deref() {
+            self.runtime.tool_router.unregister_turn(turn_id).await;
+        }
         active_turn.mark_finished();
         self.remove_active_turn(&key, &active_turn).await;
         stream_result
@@ -530,6 +728,7 @@ impl SessionManager {
             .network_access_enabled(self.config.codex.network_access_enabled)
             .web_search_enabled(self.config.codex.web_search_enabled)
             .web_search_mode(WebSearchMode::Live)
+            .dynamic_tools(vec![telegram_send_media_tool_spec()])
             .additional_directories(self.additional_directories());
 
         if let Some(model) = &self.config.codex.model {
@@ -689,18 +888,6 @@ fn next_delta_chunk(
     }
 }
 
-fn next_image_path(item: &ThreadItem, sent_images: &mut HashSet<String>) -> Option<PathBuf> {
-    let ThreadItem::ImageView(image) = item else {
-        return None;
-    };
-
-    if image.path.trim().is_empty() || !sent_images.insert(image.id.clone()) {
-        return None;
-    }
-
-    Some(PathBuf::from(&image.path))
-}
-
 fn should_forward_message(message: &AgentMessageItem) -> bool {
     if message.text.trim().is_empty() {
         return false;
@@ -727,6 +914,7 @@ impl Drop for SessionManager {
 
 enum LiveTurnEvent {
     Server(ServerEvent),
+    ToolOutput(TurnOutput),
     TurnStartResult(std::result::Result<String, codex_app_server_sdk::error::ClientError>),
     TransportClosed,
 }
@@ -789,21 +977,13 @@ async fn replay_buffered_notifications(
     thread_id: &str,
     turn_id: &str,
     text_state: &mut LiveTextState,
-    sent_images: &mut HashSet<String>,
     sink: &mut dyn OutputSink,
 ) -> Result<bool> {
     let mut terminal = false;
     for notification in buffered_notifications.iter().cloned() {
-        if handle_live_notification(
-            notification,
-            thread_id,
-            turn_id,
-            text_state,
-            sent_images,
-            sink,
-        )
-        .await?
-        .is_terminal()
+        if handle_live_notification(notification, thread_id, turn_id, text_state, sink)
+            .await?
+            .is_terminal()
         {
             terminal = true;
         }
@@ -816,7 +996,6 @@ async fn handle_live_notification(
     thread_id: &str,
     turn_id: &str,
     text_state: &mut LiveTextState,
-    sent_images: &mut HashSet<String>,
     sink: &mut dyn OutputSink,
 ) -> Result<LiveNotificationOutcome> {
     match notification {
@@ -826,9 +1005,6 @@ async fn handle_live_notification(
         {
             if let Some(item) = parse_live_item(&payload) {
                 log_live_completed_item(&item);
-                if let Some(image_path) = next_image_path(&item, sent_images) {
-                    sink.send(TurnOutput::Image(image_path)).await?;
-                }
                 if let Some(key) = live_text_item_key(&item) {
                     queue_completed_text_item(text_state, key, item, sink).await?;
                     flush_completed_text_item(text_state, sink).await?;
@@ -949,6 +1125,100 @@ fn normalized_approval_policy(value: &str) -> &'static str {
     }
 }
 
+fn telegram_send_media_tool_spec() -> DynamicToolSpec {
+    DynamicToolSpec::new(
+        "telegram_send_media",
+        "Send a local file to the current Telegram chat as a photo, document, audio file, or voice note.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "kind"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or repository-relative path to an existing local file."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["photo", "document", "audio", "voice"]
+                },
+                "caption_markdown": {
+                    "type": "string",
+                    "description": "Optional Markdown caption to send with the media."
+                },
+                "file_name": {
+                    "type": "string",
+                    "description": "Optional Telegram-side file name override."
+                },
+                "mime_type": {
+                    "type": "string",
+                    "description": "Optional MIME type override for multipart upload."
+                },
+                "disable_notification": {
+                    "type": "boolean",
+                    "description": "If true, send silently."
+                }
+            }
+        }),
+    )
+}
+
+fn parse_dynamic_tool_call_envelope(
+    params: &server_requests::DynamicToolCallParams,
+) -> std::result::Result<DynamicToolCallEnvelope, ClientError> {
+    let tool = params
+        .extra
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ClientError::InvalidMessage("dynamic tool call missing `tool`".to_string()))?
+        .to_string();
+    let arguments = params
+        .extra
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let scope = params
+        .extra
+        .get("extra")
+        .and_then(Value::as_object)
+        .unwrap_or(&params.extra);
+    let _thread_id = scope
+        .get("threadId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ClientError::InvalidMessage("dynamic tool call missing `threadId`".to_string())
+        })?;
+    let turn_id = scope
+        .get("turnId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ClientError::InvalidMessage("dynamic tool call missing `turnId`".to_string())
+        })?
+        .to_string();
+
+    Ok(DynamicToolCallEnvelope {
+        tool,
+        turn_id,
+        arguments,
+    })
+}
+
+fn media_kind_label(kind: TelegramMediaKind) -> &'static str {
+    match kind {
+        TelegramMediaKind::Photo => "photo",
+        TelegramMediaKind::Document => "document",
+        TelegramMediaKind::Audio => "audio",
+        TelegramMediaKind::Voice => "voice note",
+    }
+}
+
+fn file_name_or_path(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+}
+
 fn notification_successor_key(notification: &ServerNotification) -> Option<String> {
     match notification {
         ServerNotification::ItemStarted(payload) | ServerNotification::ItemCompleted(payload) => {
@@ -1025,9 +1295,6 @@ fn log_live_completed_item(item: &ThreadItem) {
                 text = %plan.text,
                 "live item/completed plan"
             );
-        }
-        ThreadItem::ImageView(image) => {
-            debug!(item_id = %image.id, path = %image.path, "live item/completed image");
         }
         _ => {}
     }
@@ -1111,16 +1378,6 @@ fn parse_live_item(payload: &ItemLifecycleNotification) -> Option<ThreadItem> {
                 .unwrap_or_default()
                 .to_string(),
         })),
-        Some("imageView") => Some(ThreadItem::ImageView(
-            codex_app_server_sdk::api::ImageViewItem {
-                id: id.to_string(),
-                path: object
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            },
-        )),
         _ => None,
     }
 }
@@ -1277,21 +1534,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn emits_each_image_once() {
-        let mut sent = HashSet::new();
-        let image = ThreadItem::ImageView(codex_app_server_sdk::api::ImageViewItem {
-            id: "image-1".to_string(),
-            path: "/tmp/output.png".to_string(),
-        });
-
-        assert_eq!(
-            next_image_path(&image, &mut sent),
-            Some(PathBuf::from("/tmp/output.png"))
-        );
-        assert_eq!(next_image_path(&image, &mut sent), None);
-    }
-
     #[derive(Default)]
     struct RecordingSink {
         outputs: Vec<TurnOutput>,
@@ -1378,11 +1620,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parses_telegram_send_media_dynamic_tool_params() {
+        let params = server_requests::DynamicToolCallParams {
+            extra: serde_json::from_value(json!({
+                "tool": "telegram_send_media",
+                "arguments": {
+                    "path": "/tmp/report.txt",
+                    "kind": "document",
+                    "caption_markdown": "Attached report"
+                },
+                "extra": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1"
+                }
+            }))
+            .expect("params"),
+        };
+
+        let envelope = parse_dynamic_tool_call_envelope(&params).expect("envelope");
+        assert_eq!(envelope.tool, "telegram_send_media");
+        assert_eq!(envelope.turn_id, "turn-1");
+
+        let args: TelegramSendMediaArgs =
+            serde_json::from_value(envelope.arguments).expect("arguments");
+        assert_eq!(
+            args,
+            TelegramSendMediaArgs {
+                path: "/tmp/report.txt".to_string(),
+                kind: TelegramMediaKind::Document,
+                caption_markdown: Some("Attached report".to_string()),
+                file_name: None,
+                mime_type: None,
+                disable_notification: None,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn forwards_completed_intermediate_and_final_messages_but_not_deltas_or_plans()
     -> Result<()> {
         let mut text_state = LiveTextState::default();
-        let mut sent_images = HashSet::new();
         let mut sink = RecordingSink::default();
 
         handle_live_notification(
@@ -1395,7 +1673,6 @@ mod tests {
             "thread-1",
             "turn-1",
             &mut text_state,
-            &mut sent_images,
             &mut sink,
         )
         .await?;
@@ -1410,7 +1687,6 @@ mod tests {
             "thread-1",
             "turn-1",
             &mut text_state,
-            &mut sent_images,
             &mut sink,
         )
         .await?;
@@ -1431,7 +1707,6 @@ mod tests {
             "thread-1",
             "turn-1",
             &mut text_state,
-            &mut sent_images,
             &mut sink,
         )
         .await?;
@@ -1456,7 +1731,6 @@ mod tests {
             "thread-1",
             "turn-1",
             &mut text_state,
-            &mut sent_images,
             &mut sink,
         )
         .await?;
@@ -1480,7 +1754,6 @@ mod tests {
             "thread-1",
             "turn-1",
             &mut text_state,
-            &mut sent_images,
             &mut sink,
         )
         .await?;
@@ -1502,7 +1775,6 @@ mod tests {
             "thread-1",
             "turn-1",
             &mut text_state,
-            &mut sent_images,
             &mut sink,
         )
         .await?;
@@ -1522,7 +1794,6 @@ mod tests {
     #[tokio::test]
     async fn flushes_completed_commentary_on_next_tool_lifecycle_event() -> Result<()> {
         let mut text_state = LiveTextState::default();
-        let mut sent_images = HashSet::new();
         let mut sink = RecordingSink::default();
 
         handle_live_notification(
@@ -1536,7 +1807,6 @@ mod tests {
             "thread-1",
             "turn-1",
             &mut text_state,
-            &mut sent_images,
             &mut sink,
         )
         .await?;

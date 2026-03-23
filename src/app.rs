@@ -14,8 +14,8 @@ use tracing::{error, info};
 use crate::codex::{ChatTurnRunner, OutputSink, SessionManager, TurnOutput};
 use crate::config::AppConfig;
 use crate::telegram::{
-    DownloadedAttachment, TelegramUpdate, download_attachment, normalize_update,
-    send_markdown_message, send_photo,
+    DownloadedAttachment, OutboundTelegramMedia, TelegramUpdate, download_attachment,
+    normalize_update, send_audio, send_document, send_markdown_message, send_photo, send_voice,
 };
 use crate::transcription::transcribe_voice_message;
 
@@ -243,8 +243,34 @@ impl OutputSink for TelegramSink {
                 )
                 .await
             }
-            TurnOutput::Image(path) => {
-                send_photo(&self.config, self.chat_id, self.thread_id, &path, None).await
+            TurnOutput::Media {
+                kind,
+                path,
+                caption_markdown,
+                file_name,
+                mime_type,
+                disable_notification,
+            } => {
+                let caption_html = caption_markdown
+                    .as_deref()
+                    .map(crate::markdown::markdown_to_telegram_html);
+                let media = OutboundTelegramMedia {
+                    chat_id: self.chat_id,
+                    thread_id: self.thread_id,
+                    path: &path,
+                    disable_notification,
+                    caption_html: caption_html.as_deref(),
+                    file_name_override: file_name.as_deref(),
+                    mime_type_override: mime_type.as_deref(),
+                };
+                match kind {
+                    crate::codex::TelegramMediaKind::Photo => send_photo(&self.config, media).await,
+                    crate::codex::TelegramMediaKind::Document => {
+                        send_document(&self.config, media).await
+                    }
+                    crate::codex::TelegramMediaKind::Audio => send_audio(&self.config, media).await,
+                    crate::codex::TelegramMediaKind::Voice => send_voice(&self.config, media).await,
+                }
             }
         }
     }
@@ -445,6 +471,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(true), Some(true), Some(false)]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_routes_media_outputs_through_telegram_tooling() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let update = sample_group_thread_update_with_text("send file", 777);
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        let file_path = tempdir.path().join("report.txt");
+        std::fs::write(&file_path, "report-body")?;
+        let runner = FakeTurnRunner {
+            scripted_outputs: vec![TurnOutput::Media {
+                kind: crate::codex::TelegramMediaKind::Document,
+                path: file_path,
+                caption_markdown: Some("Attached report".to_string()),
+                file_name: Some("final-report.txt".to_string()),
+                mime_type: Some("text/plain".to_string()),
+                disable_notification: true,
+            }],
+        };
+
+        process_telegram_update(&runner, &config, update, inbound).await?;
+
+        let requests = mock.requests().await;
+        let upload = requests
+            .iter()
+            .find(|request| request.path.ends_with("/sendDocument"))
+            .expect("sendDocument request");
+        let body = String::from_utf8_lossy(&upload.body);
+
+        assert!(body.contains("name=\"document\""));
+        assert!(body.contains("filename=\"final-report.txt\""));
+        assert!(body.contains("Attached report"));
+        assert!(body.contains("message_thread_id"));
+        assert!(body.contains("777"));
+        assert!(body.contains("disable_notification"));
+        assert!(body.contains("true"));
         Ok(())
     }
 
