@@ -1,0 +1,18 @@
+[Unit]
+Description=CodexClaw Telegram Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/path/to/codexclaw --config %h/.config/codexclaw/config.toml run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+Environment=RUST_LOG=codexclaw=info
+Environment=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:%h/.local/bin
+WorkingDirectory=%h
+
+[Install]
+WantedBy=default.target

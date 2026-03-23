@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.codexclaw.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/path/to/codexclaw</string>
+    <string>--config</string>
+    <string>$HOME/Library/Application Support/codexclaw/config.toml</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>WorkingDirectory</key>
+  <string>$HOME/Library/Application Support/codexclaw</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODEXCLAW_CONFIG</key>
+    <string>$HOME/Library/Application Support/codexclaw/config.toml</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Logs/codexclaw.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/codexclaw.err.log</string>
+</dict>
+</plist>
