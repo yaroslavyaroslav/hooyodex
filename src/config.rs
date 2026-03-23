@@ -78,6 +78,8 @@ pub struct CodexConfig {
     pub listen_url: String,
     #[serde(default = "default_true")]
     pub reuse_existing_server: bool,
+    #[serde(default)]
+    pub experimental_api: bool,
     pub working_directory: PathBuf,
     #[serde(default)]
     pub model: Option<String>,

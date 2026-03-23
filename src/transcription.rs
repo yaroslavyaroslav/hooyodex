@@ -118,6 +118,7 @@ mod tests {
                 connect_url: "ws://127.0.0.1:4222".to_string(),
                 listen_url: "ws://127.0.0.1:4222".to_string(),
                 reuse_existing_server: true,
+                experimental_api: false,
                 working_directory: tempdir.path().to_path_buf(),
                 model: None,
                 additional_directories: Vec::new(),

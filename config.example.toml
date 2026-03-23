@@ -17,6 +17,7 @@ model = "mlx-community/parakeet-tdt-0.6b-v3"
 connect_url = "ws://127.0.0.1:4222"
 listen_url = "ws://127.0.0.1:4222"
 reuse_existing_server = true
+experimental_api = true
 working_directory = "."
 model = "gpt-5.4"
 additional_directories = [

@@ -12,7 +12,7 @@ use codex_app_server_sdk::api::{
 use codex_app_server_sdk::events::{ServerEvent, ServerNotification};
 use codex_app_server_sdk::protocol::notifications::ItemLifecycleNotification;
 use codex_app_server_sdk::protocol::{requests, server_requests};
-use codex_app_server_sdk::{ClientError, WsConfig, WsServerHandle, WsStartConfig};
+use codex_app_server_sdk::{ClientError, CodexClient, WsConfig, WsServerHandle, WsStartConfig};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -97,6 +97,7 @@ impl DynamicToolRouter {
             config.codex.working_directory.clone(),
             config.attachment_root(),
         ];
+        append_temp_allow_roots(&mut allowed_roots);
         allowed_roots.extend(config.codex.additional_directories.iter().cloned());
         Self {
             allowed_roots,
@@ -165,7 +166,7 @@ impl DynamicToolRouter {
             extra: serde_json::from_value(json!({
                 "success": true,
                 "contentItems": [{
-                    "type": "text",
+                    "type": "inputText",
                     "text": format!(
                         "Queued Telegram {} upload for {}.",
                         media_kind_label(arguments.kind),
@@ -212,6 +213,24 @@ impl DynamicToolRouter {
             canonical_candidate.display()
         )))
     }
+}
+
+fn append_temp_allow_roots(allowed_roots: &mut Vec<PathBuf>) {
+    fn push_unique(roots: &mut Vec<PathBuf>, path: PathBuf) {
+        if !roots.iter().any(|existing| existing == &path) {
+            roots.push(path);
+        }
+    }
+
+    for raw in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
+        push_unique(allowed_roots, PathBuf::from(raw));
+    }
+
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        push_unique(allowed_roots, PathBuf::from(tmpdir));
+    }
+
+    push_unique(allowed_roots, std::env::temp_dir());
 }
 
 #[derive(Default)]
@@ -280,9 +299,10 @@ impl CodexRuntime {
             reuse_existing: config.codex.reuse_existing_server,
         })
         .await?;
-        let codex =
-            Codex::connect_ws(WsConfig::default().with_url(config.codex.connect_url.clone()))
+        let client =
+            CodexClient::connect_ws(WsConfig::default().with_url(config.codex.connect_url.clone()))
                 .await?;
+        let codex = Codex::with_initialize_params(client, build_initialize_params(config));
         let tool_router = Arc::new(DynamicToolRouter::new(config));
         let tool_router_for_handler = tool_router.clone();
         codex
@@ -298,6 +318,21 @@ impl CodexRuntime {
             tool_router,
         })
     }
+}
+
+fn build_initialize_params(config: &AppConfig) -> requests::InitializeParams {
+    let mut params = requests::InitializeParams::new(requests::ClientInfo::new(
+        "codex_sdk_rs",
+        "Codex Rust SDK",
+        env!("CARGO_PKG_VERSION"),
+    ));
+    if config.codex.experimental_api {
+        params.capabilities = Some(requests::InitializeCapabilities {
+            experimental_api: Some(true),
+            extra: Map::new(),
+        });
+    }
+    params
 }
 
 impl ActiveChatTurn {
@@ -1128,7 +1163,7 @@ fn normalized_approval_policy(value: &str) -> &'static str {
 fn telegram_send_media_tool_spec() -> DynamicToolSpec {
     DynamicToolSpec::new(
         "telegram_send_media",
-        "Send a local file to the current Telegram chat as a photo, document, audio file, or voice note.",
+        "Send a local file to the current Telegram chat as a photo, document, audio file, or voice note. Use this whenever the user should receive the actual file rather than only a text description. This is the default way to deliver screenshots, generated images, videos or screen recordings as files, audio outputs, and documents. If the artifact is a video and no dedicated video mode is available, send it as a document instead of skipping the upload.",
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -1136,23 +1171,24 @@ fn telegram_send_media_tool_spec() -> DynamicToolSpec {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute or repository-relative path to an existing local file."
+                    "description": "Absolute or repository-relative path to an existing local file that should be delivered to the Telegram user."
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["photo", "document", "audio", "voice"]
+                    "enum": ["photo", "document", "audio", "voice"],
+                    "description": "Use `photo` for images and screenshots, `document` for generic files including PDFs and videos when no dedicated video send mode exists, `audio` for audio files, and `voice` for voice-note style audio."
                 },
                 "caption_markdown": {
                     "type": "string",
-                    "description": "Optional Markdown caption to send with the media."
+                    "description": "Optional Markdown caption to send with the media. Keep it short and user-facing."
                 },
                 "file_name": {
                     "type": "string",
-                    "description": "Optional Telegram-side file name override."
+                    "description": "Optional Telegram-side file name override for the uploaded file."
                 },
                 "mime_type": {
                     "type": "string",
-                    "description": "Optional MIME type override for multipart upload."
+                    "description": "Optional MIME type override for multipart upload when the default detection is not suitable."
                 },
                 "disable_notification": {
                     "type": "boolean",
@@ -1393,6 +1429,9 @@ fn parse_agent_message_phase_local(value: &str) -> AgentMessagePhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AppConfig, AppPaths, CodexConfig, ServerConfig, TelegramConfig, VoiceConfig,
+    };
     use codex_app_server_sdk::protocol::notifications::DeltaNotification;
     use serde_json::json;
 
@@ -1620,6 +1659,46 @@ mod tests {
         }
     }
 
+    fn test_app_config(working_directory: &Path) -> AppConfig {
+        AppConfig {
+            paths: AppPaths {
+                config_path: working_directory.join("config.toml"),
+                state_dir: working_directory.join("state"),
+                cache_dir: working_directory.join("cache"),
+            },
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+            },
+            telegram: TelegramConfig {
+                bot_token: "token".to_string(),
+                allowed_user_ids: vec![42],
+                public_base_url: "https://example.com".to_string(),
+                webhook_secret: "secret".to_string(),
+                api_base_url: "https://api.telegram.org".to_string(),
+            },
+            voice: VoiceConfig {
+                enabled: true,
+                transcriber_command: "parakeet-mlx".to_string(),
+                model: "mlx-community/parakeet-tdt-0.6b-v3".to_string(),
+            },
+            codex: CodexConfig {
+                connect_url: "ws://127.0.0.1:4222".to_string(),
+                listen_url: "ws://127.0.0.1:4222".to_string(),
+                reuse_existing_server: true,
+                experimental_api: false,
+                working_directory: working_directory.to_path_buf(),
+                model: None,
+                additional_directories: Vec::new(),
+                approval_policy: "never".to_string(),
+                sandbox_mode: "danger-full-access".to_string(),
+                skip_git_repo_check: true,
+                network_access_enabled: true,
+                web_search_enabled: true,
+                orchestrator_name: None,
+            },
+        }
+    }
+
     #[test]
     fn parses_telegram_send_media_dynamic_tool_params() {
         let params = server_requests::DynamicToolCallParams {
@@ -1655,6 +1734,75 @@ mod tests {
                 disable_notification: None,
             }
         );
+    }
+
+    #[test]
+    fn initialize_params_enable_experimental_api_from_config() {
+        let mut config = test_app_config(Path::new("/tmp"));
+        config.codex.experimental_api = true;
+
+        let params = build_initialize_params(&config);
+        assert_eq!(
+            params
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.experimental_api),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn initialize_params_leave_experimental_api_disabled_by_default() {
+        let config = test_app_config(Path::new("/tmp"));
+
+        let params = build_initialize_params(&config);
+        assert!(params.capabilities.is_none());
+    }
+
+    #[test]
+    fn telegram_send_media_response_uses_input_text_content_items() {
+        let response = server_requests::DynamicToolCallResponse {
+            extra: serde_json::from_value(json!({
+                "success": true,
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": "Queued Telegram photo upload for screenshot.png."
+                }]
+            }))
+            .expect("response"),
+        };
+
+        assert_eq!(
+            response.extra.get("contentItems"),
+            Some(&json!([{
+                "type": "inputText",
+                "text": "Queued Telegram photo upload for screenshot.png."
+            }]))
+        );
+    }
+
+    #[test]
+    fn dynamic_tool_router_allows_standard_temp_roots() {
+        let config = test_app_config(Path::new("/tmp/workspace"));
+        let router = DynamicToolRouter::new(&config);
+
+        assert!(router.allowed_roots.contains(&PathBuf::from("/tmp")));
+        assert!(
+            router
+                .allowed_roots
+                .contains(&PathBuf::from("/private/tmp"))
+        );
+        assert!(router.allowed_roots.contains(&PathBuf::from("/var/tmp")));
+        assert!(
+            router
+                .allowed_roots
+                .contains(&PathBuf::from("/private/var/tmp"))
+        );
+        assert!(router.allowed_roots.contains(&std::env::temp_dir()));
+
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            assert!(router.allowed_roots.contains(&PathBuf::from(tmpdir)));
+        }
     }
 
     #[tokio::test]
