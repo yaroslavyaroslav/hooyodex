@@ -143,50 +143,14 @@ pub fn split_telegram_message(text: &str, limit: usize) -> Vec<String> {
 }
 
 fn render_inline(text: &str) -> String {
-    let mut result = escape_html(text);
-
-    while let Some(start) = result.find('[') {
-        if let Some(mid_rel) = result[start..].find("](") {
-            let mid = start + mid_rel;
-            if let Some(end_rel) = result[mid + 2..].find(')') {
-                let end = mid + 2 + end_rel;
-                let label = result[start + 1..mid].to_string();
-                let url = result[mid + 2..end].to_string();
-                result = format!(
-                    "{}<a href=\"{}\">{}</a>{}",
-                    &result[..start],
-                    url,
-                    label,
-                    &result[end + 1..]
-                );
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
+    let (protected, code_spans) = protect_code_spans(text);
+    let mut result = render_links(&escape_html(&protected));
 
     while let Some(start) = result.find("**") {
         if let Some(end_rel) = result[start + 2..].find("**") {
             let end = start + 2 + end_rel;
             let inner = result[start + 2..end].to_string();
             result = format!("{}<b>{}</b>{}", &result[..start], inner, &result[end + 2..]);
-        } else {
-            break;
-        }
-    }
-
-    while let Some(start) = result.find('`') {
-        if let Some(end_rel) = result[start + 1..].find('`') {
-            let end = start + 1 + end_rel;
-            let inner = result[start + 1..end].to_string();
-            result = format!(
-                "{}<code>{}</code>{}",
-                &result[..start],
-                inner,
-                &result[end + 1..]
-            );
         } else {
             break;
         }
@@ -212,13 +176,129 @@ fn render_inline(text: &str) -> String {
         }
         i += 1;
     }
-    output
+    restore_code_spans(output, &code_spans)
 }
 
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn protect_code_spans(text: &str) -> (String, Vec<String>) {
+    let mut output = String::new();
+    let mut code_spans = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] == '`'
+            && let Some(end_rel) = chars[i + 1..].iter().position(|c| *c == '`')
+        {
+            let end = i + 1 + end_rel;
+            let inner: String = chars[i + 1..end].iter().collect();
+            let placeholder = format!("@@CODE_SPAN_{}@@", code_spans.len());
+            code_spans.push(format!("<code>{}</code>", escape_html(&inner)));
+            output.push_str(&placeholder);
+            i = end + 1;
+            continue;
+        }
+        output.push(chars[i]);
+        i += 1;
+    }
+
+    (output, code_spans)
+}
+
+fn restore_code_spans(mut text: String, code_spans: &[String]) -> String {
+    for (index, html) in code_spans.iter().enumerate() {
+        let placeholder = format!("@@CODE_SPAN_{index}@@");
+        text = text.replace(&placeholder, html);
+    }
+    text
+}
+
+fn render_links(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] == '['
+            && let Some((label, href, next_index)) = parse_markdown_link(&chars, i)
+        {
+            output.push_str("<a href=\"");
+            output.push_str(&escape_html_attribute(&href));
+            output.push_str("\">");
+            output.push_str(&label);
+            output.push_str("</a>");
+            i = next_index;
+            continue;
+        }
+
+        output.push(chars[i]);
+        i += 1;
+    }
+
+    output
+}
+
+fn parse_markdown_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    let label_end_rel = chars[start + 1..].iter().position(|c| *c == ']')?;
+    let label_end = start + 1 + label_end_rel;
+    if chars.get(label_end + 1) != Some(&'(') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut url_end = None;
+    let mut i = label_end + 2;
+    while i < chars.len() {
+        match chars[i] {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    url_end = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let url_end = url_end?;
+    let label: String = chars[start + 1..label_end].iter().collect();
+    let raw_target: String = chars[label_end + 2..url_end].iter().collect();
+    let href = parse_link_target(&raw_target)?;
+    Some((label, href, url_end + 1))
+}
+
+fn parse_link_target(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('<') {
+        let end = rest.find('>')?;
+        let candidate = rest[..end].trim();
+        if candidate.is_empty() {
+            return None;
+        }
+        return Some(candidate.to_string());
+    }
+
+    let href = trimmed.split_whitespace().next()?;
+    if href.is_empty() {
+        return None;
+    }
+    Some(href.to_string())
+}
+
+fn escape_html_attribute(text: &str) -> String {
+    text.replace('"', "&quot;")
 }
 
 fn fence_delimiter(line: &str) -> Option<&'static str> {
@@ -268,6 +348,35 @@ mod tests {
         assert!(rendered.contains("<b>Title</b>"));
         assert!(rendered.contains("<b>bold</b>"));
         assert!(rendered.contains("<code>code</code>"));
+    }
+
+    #[test]
+    fn preserves_markdown_link_literal_inside_code_span() {
+        let rendered = markdown_to_telegram_html("`[x](url \"title\")`");
+        assert_eq!(rendered, "<code>[x](url \"title\")</code>");
+    }
+
+    #[test]
+    fn renders_links_with_nested_parentheses_and_brackets_in_target() {
+        let rendered = markdown_to_telegram_html(
+            "[file](/Users/test/app/[lang]/(app)/(no-header)/component.tsx#L32)",
+        );
+        assert_eq!(
+            rendered,
+            "<a href=\"/Users/test/app/[lang]/(app)/(no-header)/component.tsx#L32\">file</a>"
+        );
+        assert_eq!(rendered.matches("<a ").count(), 1);
+    }
+
+    #[test]
+    fn strips_optional_markdown_link_title_and_escapes_quotes_in_href() {
+        let rendered = markdown_to_telegram_html(
+            "[title](https://example.com/path?q=\"x\" \"Example title\")",
+        );
+        assert_eq!(
+            rendered,
+            "<a href=\"https://example.com/path?q=&quot;x&quot;\">title</a>"
+        );
     }
 
     #[test]
