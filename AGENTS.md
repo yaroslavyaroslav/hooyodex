@@ -21,6 +21,7 @@ CodexClaw is a small Rust service that connects Telegram webhooks to persistent 
 - Whitelist and normalization behavior must stay conservative: ignore unknown senders and unsupported updates quietly.
 - Treat Telegram delivery as an integration surface, not just a formatting layer.
 - When changing outbound behavior, verify what Telegram actually receives, not only what the code intended to send.
+- Do not add bridge-local sandboxing or path restrictions on top of Codex capabilities; if access control matters, rely on Codex's own sandboxing and capability model.
 - For live Codex output, Telegram should receive completed user-visible assistant messages, including legitimate intermediate commentary and the final answer, but not raw delta fragments.
 - Do not forward plan items to Telegram as chat messages.
 - If intermediate Telegram delivery timing changes, prefer lifecycle-based flush points (next item/tool/server event or turn completion) over assumptions that token deltas are globally serial.
