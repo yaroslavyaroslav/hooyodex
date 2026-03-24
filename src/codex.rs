@@ -87,20 +87,14 @@ struct DynamicToolCallEnvelope {
 
 #[derive(Default)]
 struct DynamicToolRouter {
-    allowed_roots: Vec<PathBuf>,
+    working_directory: PathBuf,
     turn_outputs: Mutex<HashMap<String, mpsc::Sender<TurnOutput>>>,
 }
 
 impl DynamicToolRouter {
     fn new(config: &AppConfig) -> Self {
-        let mut allowed_roots = vec![
-            config.codex.working_directory.clone(),
-            config.attachment_root(),
-        ];
-        append_temp_allow_roots(&mut allowed_roots);
-        allowed_roots.extend(config.codex.additional_directories.iter().cloned());
         Self {
-            allowed_roots,
+            working_directory: config.codex.working_directory.clone(),
             turn_outputs: Mutex::new(HashMap::new()),
         }
     }
@@ -120,21 +114,50 @@ impl DynamicToolRouter {
         &self,
         params: server_requests::DynamicToolCallParams,
     ) -> std::result::Result<server_requests::DynamicToolCallResponse, ClientError> {
-        let envelope = parse_dynamic_tool_call_envelope(&params)?;
+        let envelope = parse_dynamic_tool_call_envelope(&params).map_err(|error| {
+            warn!(error = %error, extra = ?params.extra, "dynamic tool call rejected");
+            error
+        })?;
         if envelope.tool != "telegram_send_media" {
-            return Err(ClientError::InvalidMessage(format!(
+            let error = ClientError::InvalidMessage(format!(
                 "unsupported dynamic tool `{}`",
                 envelope.tool
-            )));
+            ));
+            warn!(
+                error = %error,
+                tool = %envelope.tool,
+                turn_id = %envelope.turn_id,
+                "dynamic tool call rejected"
+            );
+            return Err(error);
         }
 
-        let arguments: TelegramSendMediaArgs = serde_json::from_value(envelope.arguments)?;
+        let arguments: TelegramSendMediaArgs = serde_json::from_value(envelope.arguments.clone())
+            .map_err(|error| {
+            warn!(
+                error = %error,
+                tool = %envelope.tool,
+                turn_id = %envelope.turn_id,
+                raw_arguments = ?envelope.arguments,
+                "dynamic tool arguments failed to parse"
+            );
+            ClientError::from(error)
+        })?;
         let display_name = arguments
             .file_name
             .as_deref()
             .unwrap_or_else(|| file_name_or_path(&arguments.path))
             .to_string();
-        let path = self.resolve_allowed_path(&arguments.path).await?;
+        let path = self.resolve_path(&arguments.path).await.map_err(|error| {
+            warn!(
+                error = %error,
+                tool = %envelope.tool,
+                turn_id = %envelope.turn_id,
+                path = %arguments.path,
+                "dynamic tool path resolution failed"
+            );
+            error
+        })?;
         let output = TurnOutput::Media {
             kind: arguments.kind,
             path,
@@ -151,16 +174,28 @@ impl DynamicToolRouter {
             .get(&envelope.turn_id)
             .cloned()
             .ok_or_else(|| {
-                ClientError::InvalidMessage(format!(
+                let error = ClientError::InvalidMessage(format!(
                     "no active Telegram sink for turn {}",
                     envelope.turn_id
-                ))
+                ));
+                warn!(
+                    error = %error,
+                    tool = %envelope.tool,
+                    turn_id = %envelope.turn_id,
+                    "dynamic tool sink lookup failed"
+                );
+                error
             })?;
 
-        sender
-            .send(output)
-            .await
-            .map_err(|_| ClientError::TransportClosed)?;
+        sender.send(output).await.map_err(|_| {
+            warn!(
+                tool = %envelope.tool,
+                turn_id = %envelope.turn_id,
+                path = %arguments.path,
+                "dynamic tool output channel closed"
+            );
+            ClientError::TransportClosed
+        })?;
 
         Ok(server_requests::DynamicToolCallResponse {
             extra: serde_json::from_value(json!({
@@ -177,60 +212,19 @@ impl DynamicToolRouter {
         })
     }
 
-    async fn resolve_allowed_path(
-        &self,
-        raw_path: &str,
-    ) -> std::result::Result<PathBuf, ClientError> {
+    async fn resolve_path(&self, raw_path: &str) -> std::result::Result<PathBuf, ClientError> {
         let candidate = PathBuf::from(raw_path);
-        let canonical_candidate = match tokio::fs::canonicalize(&candidate).await {
+        Ok(match tokio::fs::canonicalize(&candidate).await {
             Ok(path) => path,
             Err(first_error) if candidate.is_absolute() => {
                 return Err(ClientError::Io(first_error));
             }
             Err(_) => {
-                let joined = self
-                    .allowed_roots
-                    .first()
-                    .map(|root| root.join(&candidate))
-                    .ok_or_else(|| {
-                        ClientError::InvalidMessage("no allowed directories configured".to_string())
-                    })?;
+                let joined = self.working_directory.join(&candidate);
                 tokio::fs::canonicalize(joined).await?
             }
-        };
-
-        for root in &self.allowed_roots {
-            let Ok(canonical_root) = tokio::fs::canonicalize(root).await else {
-                continue;
-            };
-            if canonical_candidate.starts_with(&canonical_root) {
-                return Ok(canonical_candidate);
-            }
-        }
-
-        Err(ClientError::InvalidMessage(format!(
-            "path `{}` is outside allowed directories",
-            canonical_candidate.display()
-        )))
+        })
     }
-}
-
-fn append_temp_allow_roots(allowed_roots: &mut Vec<PathBuf>) {
-    fn push_unique(roots: &mut Vec<PathBuf>, path: PathBuf) {
-        if !roots.iter().any(|existing| existing == &path) {
-            roots.push(path);
-        }
-    }
-
-    for raw in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
-        push_unique(allowed_roots, PathBuf::from(raw));
-    }
-
-    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-        push_unique(allowed_roots, PathBuf::from(tmpdir));
-    }
-
-    push_unique(allowed_roots, std::env::temp_dir());
 }
 
 #[derive(Default)]
@@ -1781,28 +1775,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dynamic_tool_router_allows_standard_temp_roots() {
-        let config = test_app_config(Path::new("/tmp/workspace"));
+    #[tokio::test]
+    async fn dynamic_tool_router_resolves_relative_paths_from_working_directory() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let docs_dir = tempdir.path().join("Documents");
+        std::fs::create_dir_all(&docs_dir).expect("create docs dir");
+        let file_path = docs_dir.join("example.pdf");
+        std::fs::write(&file_path, b"pdf").expect("write file");
+
+        let config = test_app_config(tempdir.path());
         let router = DynamicToolRouter::new(&config);
 
-        assert!(router.allowed_roots.contains(&PathBuf::from("/tmp")));
-        assert!(
-            router
-                .allowed_roots
-                .contains(&PathBuf::from("/private/tmp"))
-        );
-        assert!(router.allowed_roots.contains(&PathBuf::from("/var/tmp")));
-        assert!(
-            router
-                .allowed_roots
-                .contains(&PathBuf::from("/private/var/tmp"))
-        );
-        assert!(router.allowed_roots.contains(&std::env::temp_dir()));
-
-        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            assert!(router.allowed_roots.contains(&PathBuf::from(tmpdir)));
-        }
+        let resolved = router
+            .resolve_path("Documents/example.pdf")
+            .await
+            .expect("resolve path");
+        assert_eq!(resolved, file_path.canonicalize().expect("canonical path"));
     }
 
     #[tokio::test]
