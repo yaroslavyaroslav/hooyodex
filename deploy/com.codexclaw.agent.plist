@@ -10,6 +10,7 @@
     <string>__BIN__</string>
     <string>--config</string>
     <string>__CONFIG_DIR__/config.toml</string>
+    <string>run</string>
   </array>
 
   <key>RunAtLoad</key>

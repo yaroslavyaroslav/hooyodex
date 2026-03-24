@@ -5,7 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 LABEL_MAC="com.codexclaw.agent"
 LABEL_LINUX="codexclaw.service"
-CONFIG_DIR="${CODEXCLAW_CONFIG_DIR:-$HOME/.config/codexclaw}"
+DEFAULT_CONFIG_DIR="$HOME/Library/Application Support/codexclaw"
+CONFIG_DIR="${CODEXCLAW_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"
 
 escape_sed() {
   printf '%s' "$1" | sed -e 's/[\/&|]/\\&/g'
@@ -60,7 +61,7 @@ main() {
     darwin)
       local launch_agents_dir dest plist_label
       launch_agents_dir="$HOME/Library/LaunchAgents"
-      dest="$launch_agents_dir/$LABEL_MAC"
+      dest="$launch_agents_dir/$LABEL_MAC.plist"
       plist_label="$LABEL_MAC"
       mkdir -p "$launch_agents_dir"
       render_template "$ROOT_DIR/deploy/com.codexclaw.agent.plist" "$dest" "$bin_path"

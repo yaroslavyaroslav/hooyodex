@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=__BIN__ --config %h/.config/codexclaw/config.toml
+ExecStart=__BIN__ --config %h/.config/codexclaw/config.toml run
 WorkingDirectory=%h/.config/codexclaw
 Environment=CODEXCLAW_CONFIG=%h/.config/codexclaw/config.toml
 Environment=RUST_LOG=info
