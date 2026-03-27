@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -16,7 +17,8 @@ use codex_app_server_sdk::{ClientError, CodexClient, WsConfig, WsServerHandle, W
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
-use tracing::{debug, warn};
+use tokio::time::{MissedTickBehavior, Instant, interval_at};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::state::PersistentState;
@@ -27,6 +29,8 @@ pub struct CodexRuntime {
     pub _server: WsServerHandle,
     tool_router: Arc<DynamicToolRouter>,
 }
+
+const PROACTIVE_AUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct SessionManager {
     runtime: CodexRuntime,
@@ -314,6 +318,52 @@ impl CodexRuntime {
     }
 }
 
+fn spawn_proactive_auth_refresh_task(codex: Codex) {
+    tokio::spawn(async move {
+        match refresh_managed_chatgpt_auth(&codex).await {
+            Ok(()) => {
+                info!("completed startup proactive Codex auth refresh");
+            }
+            Err(error) => {
+                warn!("startup proactive Codex auth refresh failed: {error}");
+            }
+        }
+
+        let mut interval = interval_at(
+            Instant::now() + PROACTIVE_AUTH_REFRESH_INTERVAL,
+            PROACTIVE_AUTH_REFRESH_INTERVAL,
+        );
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        info!(
+            "scheduled proactive Codex auth refresh every {} hours",
+            PROACTIVE_AUTH_REFRESH_INTERVAL.as_secs() / 3600
+        );
+
+        loop {
+            interval.tick().await;
+            match refresh_managed_chatgpt_auth(&codex).await {
+                Ok(()) => {
+                    info!("completed scheduled proactive Codex auth refresh");
+                }
+                Err(error) => {
+                    warn!("scheduled proactive Codex auth refresh failed: {error}");
+                }
+            }
+        }
+    });
+}
+
+async fn refresh_managed_chatgpt_auth(codex: &Codex) -> Result<()> {
+    codex
+        .account_read(requests::GetAccountParams {
+            refresh_token: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    Ok(())
+}
+
 fn build_initialize_params(config: &AppConfig) -> requests::InitializeParams {
     let mut params = requests::InitializeParams::new(requests::ClientInfo::new(
         "codex_sdk_rs",
@@ -374,6 +424,7 @@ impl ActiveChatTurn {
 impl SessionManager {
     pub async fn new(config: AppConfig) -> Result<Self> {
         let runtime = CodexRuntime::start(&config).await?;
+        spawn_proactive_auth_refresh_task(runtime.codex.clone());
         let state = PersistentState::load(&config.sessions_path())?;
         Ok(Self {
             runtime,
