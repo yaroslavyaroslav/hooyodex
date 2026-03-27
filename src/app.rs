@@ -843,6 +843,82 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "requires live Codex auth/network; run manually"]
+    async fn e2e_live_codex_keeps_telegram_threads_separate_via_named_sessions() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = live_e2e_config(tempdir.path(), &mock.base_url)?;
+
+        let sessions = SessionManager::new(config.clone()).await?;
+        sessions.ensure_orchestrator().await?;
+        let alpha_store = sample_group_thread_update_with_text(
+            "For this Telegram thread only, remember the token ALPHA_THREAD_ONLY. Do not mention any other thread. Reply with exactly STORED_ALPHA and nothing else.",
+            111,
+        );
+        let inbound = normalize_update(&alpha_store, &[42]).expect("inbound");
+        process_telegram_update(&sessions, &config, alpha_store, inbound).await?;
+
+        let sessions = SessionManager::new(config.clone()).await?;
+        sessions.ensure_orchestrator().await?;
+        let beta_check = sample_group_thread_update_with_text(
+            "Reply with exactly THREAD_BETA_EMPTY if this Telegram thread has not yet been told any token. Do not guess and do not mention other threads.",
+            222,
+        );
+        let inbound = normalize_update(&beta_check, &[42]).expect("inbound");
+        process_telegram_update(&sessions, &config, beta_check, inbound).await?;
+
+        let sessions = SessionManager::new(config.clone()).await?;
+        sessions.ensure_orchestrator().await?;
+        let alpha_recall = sample_group_thread_update_with_text(
+            "Reply with exactly ALPHA_THREAD_ONLY if you remember the token previously stored in this same Telegram thread.",
+            111,
+        );
+        let inbound = normalize_update(&alpha_recall, &[42]).expect("inbound");
+        process_telegram_update(&sessions, &config, alpha_recall, inbound).await?;
+
+        let requests = mock.requests().await;
+        let send_messages: Vec<(Option<i64>, String)> = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/sendMessage"))
+            .map(|request| {
+                let value: Value = serde_json::from_slice(&request.body).expect("sendMessage json");
+                (
+                    value.get("message_thread_id").and_then(Value::as_i64),
+                    value["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                )
+            })
+            .collect();
+
+        assert!(
+            send_messages
+                .iter()
+                .any(|(thread_id, text)| *thread_id == Some(111) && text == "STORED_ALPHA"),
+            "expected STORED_ALPHA in Telegram thread 111, got {:?}",
+            send_messages
+        );
+        assert!(
+            send_messages
+                .iter()
+                .find(|(thread_id, _)| *thread_id == Some(222))
+                .is_some_and(|(_, text)| !text.contains("ALPHA_THREAD_ONLY")),
+            "expected Telegram thread 222 to stay isolated from ALPHA_THREAD_ONLY, got {:?}",
+            send_messages
+        );
+        assert!(
+            send_messages
+                .iter()
+                .any(|(thread_id, text)| *thread_id == Some(111) && text == "ALPHA_THREAD_ONLY"),
+            "expected ALPHA_THREAD_ONLY recall in Telegram thread 111, got {:?}",
+            send_messages
+        );
+        Ok(())
+    }
+
     fn test_config(working_directory: &std::path::Path, api_base_url: &str) -> AppConfig {
         AppConfig {
             paths: AppPaths {

@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use codex_app_server_sdk::api::{
     AgentMessageItem, AgentMessagePhase, ApprovalMode, Codex, DynamicToolSpec, Input, SandboxMode,
@@ -17,7 +18,7 @@ use codex_app_server_sdk::{ClientError, CodexClient, WsConfig, WsServerHandle, W
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
-use tokio::time::{MissedTickBehavior, Instant, interval_at};
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
@@ -80,6 +81,12 @@ struct TelegramSendMediaArgs {
     mime_type: Option<String>,
     #[serde(default)]
     disable_notification: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionIndexEntry {
+    id: String,
+    thread_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,15 +501,13 @@ impl SessionManager {
 
         let mut text_state = LiveTextState::default();
 
-        let thread_id = prepare_live_thread(&mut *thread).await?;
+        let thread_id = self.ensure_chat_thread_identity(&mut thread, &key).await?;
         let active_turn = Arc::new(ActiveChatTurn::new(thread_id.clone()));
         self.active_turns
             .lock()
             .await
             .insert(key.clone(), active_turn.clone());
         drop(thread);
-
-        self.persist_chat_thread_id(&key, &thread_id).await?;
 
         let turn_params = self.build_live_turn_start_params(&thread_id, input);
         let client = self.runtime.codex.client();
@@ -635,23 +640,12 @@ impl SessionManager {
 
     pub async fn reset_chat_thread(&self, inbound: &InboundMessage) -> Result<()> {
         let key = chat_session_key(inbound);
-        let session = Arc::new(Mutex::new(
-            self.runtime.codex.start_thread(self.base_thread_options()),
-        ));
-        let mut thread = session.lock().await;
-        let _ = prepare_live_thread(&mut *thread).await?;
-        let thread_id = thread
-            .id()
-            .map(ToString::to_string)
-            .ok_or_else(|| anyhow!("thread id unavailable after reset"))?;
-        drop(thread);
+        let mut thread = self.runtime.codex.start_thread(self.base_thread_options());
+        self.assign_chat_thread_name(&mut thread, &key).await?;
+        let session = Arc::new(Mutex::new(thread));
 
         self.active_turns.lock().await.remove(&key);
         self.chats.lock().await.insert(key.clone(), session);
-
-        let mut state = self.state.lock().await;
-        state.chat_threads.insert(key, thread_id);
-        state.save(&self.sessions_path)?;
         Ok(())
     }
 
@@ -660,13 +654,14 @@ impl SessionManager {
             return Ok(existing);
         }
 
-        let existing_id = self.state.lock().await.chat_threads.get(key).cloned();
-        let thread = if let Some(thread_id) = existing_id {
+        let thread = if let Some(thread_id) = self.find_chat_thread_id_by_name(key).await? {
             self.runtime
                 .codex
                 .resume_thread_by_id(thread_id, self.base_thread_options())
         } else {
-            self.runtime.codex.start_thread(self.base_thread_options())
+            let mut thread = self.runtime.codex.start_thread(self.base_thread_options());
+            self.assign_chat_thread_name(&mut thread, key).await?;
+            thread
         };
         let session = Arc::new(Mutex::new(thread));
         self.chats
@@ -726,15 +721,24 @@ impl SessionManager {
         Ok(())
     }
 
-    async fn persist_chat_thread_id(&self, key: &str, thread_id: &str) -> Result<()> {
-        let mut state = self.state.lock().await;
-        if state.chat_threads.get(key).map(String::as_str) != Some(thread_id) {
-            state
-                .chat_threads
-                .insert(key.to_string(), thread_id.to_string());
-            state.save(&self.sessions_path)?;
+    async fn find_chat_thread_id_by_name(&self, key: &str) -> Result<Option<String>> {
+        let thread_name = chat_thread_name(key);
+        find_thread_id_in_session_index(&codex_session_index_path()?, &thread_name)
+    }
+
+    async fn assign_chat_thread_name(&self, thread: &mut Thread, key: &str) -> Result<String> {
+        thread.set_name(chat_thread_name(key)).await?;
+        thread
+            .id()
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow!("thread id unavailable after naming"))
+    }
+
+    async fn ensure_chat_thread_identity(&self, thread: &mut Thread, key: &str) -> Result<String> {
+        if thread.id().is_none() {
+            return self.assign_chat_thread_name(thread, key).await;
         }
-        Ok(())
+        prepare_live_thread(thread).await
     }
 
     fn build_input(
@@ -901,6 +905,44 @@ fn chat_session_key(inbound: &InboundMessage) -> String {
         Some(thread_id) => format!("{}:{thread_id}", inbound.chat_id),
         None => inbound.chat_id.to_string(),
     }
+}
+
+fn chat_thread_name(key: &str) -> String {
+    format!("telegram:{key}")
+}
+
+fn codex_session_index_path() -> Result<PathBuf> {
+    if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
+        return Ok(PathBuf::from(codex_home).join("session_index.jsonl"));
+    }
+
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
+    Ok(home.join(".codex").join("session_index.jsonl"))
+}
+
+fn find_thread_id_in_session_index(path: &Path, thread_name: &str) -> Result<Option<String>> {
+    if thread_name.trim().is_empty() || !path.exists() {
+        return Ok(None);
+    }
+
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut found = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(trimmed) else {
+            continue;
+        };
+        if entry.thread_name == thread_name {
+            found = Some(entry.id);
+        }
+    }
+
+    Ok(found)
 }
 
 #[async_trait]
@@ -2172,5 +2214,30 @@ mod tests {
         let mut root_inbound = inbound;
         root_inbound.thread_id = None;
         assert_eq!(chat_session_key(&root_inbound), "42");
+    }
+
+    #[test]
+    fn chat_thread_name_uses_stable_telegram_prefix() {
+        assert_eq!(chat_thread_name("42"), "telegram:42");
+        assert_eq!(chat_thread_name("42:9001"), "telegram:42:9001");
+    }
+
+    #[test]
+    fn session_index_lookup_uses_newest_matching_thread_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session_index.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"id\":\"thread-1\",\"thread_name\":\"telegram:42\",\"updated_at\":\"2026-03-27T10:00:00Z\"}\n",
+                "{\"id\":\"thread-2\",\"thread_name\":\"telegram:9\",\"updated_at\":\"2026-03-27T10:01:00Z\"}\n",
+                "{\"id\":\"thread-3\",\"thread_name\":\"telegram:42\",\"updated_at\":\"2026-03-27T10:02:00Z\"}\n",
+                "{\"id\":\"ignored\",\"thread_name\":\"telegram:42:extra\",\"updated_at\":\"2026-03-27T10:03:00Z\"}\n",
+            ),
+        )
+        .expect("write session index");
+
+        let found = find_thread_id_in_session_index(&path, "telegram:42").expect("lookup");
+        assert_eq!(found.as_deref(), Some("thread-3"));
     }
 }

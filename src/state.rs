@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -8,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistentState {
     pub orchestrator_thread_id: Option<String>,
-    pub chat_threads: BTreeMap<String, String>,
 }
 
 impl PersistentState {
@@ -47,14 +45,9 @@ mod tests {
         let path = dir.path().join("sessions.json");
         let state = PersistentState {
             orchestrator_thread_id: Some("orch".to_string()),
-            chat_threads: BTreeMap::from([(String::from("42"), String::from("thread-42"))]),
         };
         state.save(&path).expect("save");
         let loaded = PersistentState::load(&path).expect("load");
         assert_eq!(loaded.orchestrator_thread_id.as_deref(), Some("orch"));
-        assert_eq!(
-            loaded.chat_threads.get("42").map(String::as_str),
-            Some("thread-42")
-        );
     }
 }
