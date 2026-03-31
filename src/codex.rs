@@ -18,9 +18,12 @@ use codex_app_server_sdk::{ClientError, CodexClient, WsConfig, WsServerHandle, W
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{debug, info, warn};
 
+use crate::approval::{ApprovalManager, ApprovalOutcome, OperatorTarget};
+use crate::channels::{ChannelKind, EventRoute, MediaKind, TurnOutput};
 use crate::config::AppConfig;
 use crate::state::PersistentState;
 use crate::telegram::{DownloadedAttachment, InboundMessage};
@@ -34,45 +37,49 @@ pub struct CodexRuntime {
 const PROACTIVE_AUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct SessionManager {
-    runtime: CodexRuntime,
+    runtime: tokio::sync::RwLock<Arc<CodexRuntime>>,
+    approvals: Arc<ApprovalManager>,
     config: AppConfig,
     sessions_path: PathBuf,
     state: Mutex<PersistentState>,
     chats: Mutex<HashMap<String, Arc<Mutex<Thread>>>>,
     active_turns: Mutex<HashMap<String, Arc<ActiveChatTurn>>>,
     orchestrator: Mutex<Option<Arc<Mutex<Thread>>>>,
+    auth_refresh_task: Mutex<Option<JoinHandle<()>>>,
+    reconnect_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
-pub enum TurnOutput {
-    Markdown {
-        text: String,
-        disable_notification: bool,
-    },
-    Media {
-        kind: TelegramMediaKind,
-        path: PathBuf,
-        caption_markdown: Option<String>,
-        file_name: Option<String>,
-        mime_type: Option<String>,
-        disable_notification: bool,
-    },
+pub struct ChatRequest {
+    pub session_key: String,
+    pub sender_name: String,
+    pub text: Option<String>,
+    pub operator_target: OperatorTarget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TelegramMediaKind {
-    Photo,
-    Document,
-    Audio,
-    Voice,
+impl ChatRequest {
+    pub fn from_telegram(inbound: InboundMessage, operator_target: OperatorTarget) -> Self {
+        let session_key = EventRoute {
+            channel: ChannelKind::Telegram,
+            account_id: "default".to_string(),
+            conversation_id: inbound.chat_id.to_string(),
+            thread_id: inbound.thread_id.map(|value| value.to_string()),
+        }
+        .session_key();
+        Self {
+            session_key,
+            sender_name: inbound.sender_name,
+            text: inbound.text,
+            operator_target,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 struct TelegramSendMediaArgs {
     path: String,
-    kind: TelegramMediaKind,
+    kind: MediaKind,
     #[serde(default)]
     caption_markdown: Option<String>,
     #[serde(default)]
@@ -81,6 +88,17 @@ struct TelegramSendMediaArgs {
     mime_type: Option<String>,
     #[serde(default)]
     disable_notification: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+struct TelegramRequestApprovalArgs {
+    summary_markdown: String,
+    proposed_reply: String,
+    #[serde(default)]
+    operator_chat_id: Option<i64>,
+    #[serde(default)]
+    operator_thread_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,29 +114,46 @@ struct DynamicToolCallEnvelope {
     arguments: Value,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct ActiveTurnContext {
+    output_sender: mpsc::Sender<TurnOutput>,
+    operator_target: OperatorTarget,
+}
+
 struct DynamicToolRouter {
     working_directory: PathBuf,
-    turn_outputs: Mutex<HashMap<String, mpsc::Sender<TurnOutput>>>,
+    config: AppConfig,
+    approvals: Arc<ApprovalManager>,
+    turn_contexts: Mutex<HashMap<String, ActiveTurnContext>>,
 }
 
 impl DynamicToolRouter {
-    fn new(config: &AppConfig) -> Self {
+    fn new(config: &AppConfig, approvals: Arc<ApprovalManager>) -> Self {
         Self {
             working_directory: config.codex.working_directory.clone(),
-            turn_outputs: Mutex::new(HashMap::new()),
+            config: config.clone(),
+            approvals,
+            turn_contexts: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn register_turn(&self, turn_id: &str, sender: mpsc::Sender<TurnOutput>) {
-        self.turn_outputs
-            .lock()
-            .await
-            .insert(turn_id.to_string(), sender);
+    async fn register_turn(
+        &self,
+        turn_id: &str,
+        sender: mpsc::Sender<TurnOutput>,
+        operator_target: OperatorTarget,
+    ) {
+        self.turn_contexts.lock().await.insert(
+            turn_id.to_string(),
+            ActiveTurnContext {
+                output_sender: sender,
+                operator_target,
+            },
+        );
     }
 
     async fn unregister_turn(&self, turn_id: &str) {
-        self.turn_outputs.lock().await.remove(turn_id);
+        self.turn_contexts.lock().await.remove(turn_id);
     }
 
     async fn handle_call(
@@ -129,20 +164,29 @@ impl DynamicToolRouter {
             warn!(error = %error, extra = ?params.extra, "dynamic tool call rejected");
             error
         })?;
-        if envelope.tool != "telegram_send_media" {
-            let error = ClientError::InvalidMessage(format!(
-                "unsupported dynamic tool `{}`",
-                envelope.tool
-            ));
-            warn!(
-                error = %error,
-                tool = %envelope.tool,
-                turn_id = %envelope.turn_id,
-                "dynamic tool call rejected"
-            );
-            return Err(error);
+        match envelope.tool.as_str() {
+            "telegram_send_media" => self.handle_send_media(envelope).await,
+            "telegram_request_approval" => self.handle_request_approval(envelope).await,
+            _ => {
+                let error = ClientError::InvalidMessage(format!(
+                    "unsupported dynamic tool `{}`",
+                    envelope.tool
+                ));
+                warn!(
+                    error = %error,
+                    tool = %envelope.tool,
+                    turn_id = %envelope.turn_id,
+                    "dynamic tool call rejected"
+                );
+                Err(error)
+            }
         }
+    }
 
+    async fn handle_send_media(
+        &self,
+        envelope: DynamicToolCallEnvelope,
+    ) -> std::result::Result<server_requests::DynamicToolCallResponse, ClientError> {
         let arguments: TelegramSendMediaArgs = serde_json::from_value(envelope.arguments.clone())
             .map_err(|error| {
             warn!(
@@ -179,11 +223,11 @@ impl DynamicToolRouter {
         };
 
         let sender = self
-            .turn_outputs
+            .turn_contexts
             .lock()
             .await
             .get(&envelope.turn_id)
-            .cloned()
+            .map(|context| context.output_sender.clone())
             .ok_or_else(|| {
                 let error = ClientError::InvalidMessage(format!(
                     "no active Telegram sink for turn {}",
@@ -220,6 +264,85 @@ impl DynamicToolRouter {
                     )
                 }]
             }))?,
+        })
+    }
+
+    async fn handle_request_approval(
+        &self,
+        envelope: DynamicToolCallEnvelope,
+    ) -> std::result::Result<server_requests::DynamicToolCallResponse, ClientError> {
+        let arguments: TelegramRequestApprovalArgs =
+            serde_json::from_value(envelope.arguments.clone()).map_err(|error| {
+                warn!(
+                    error = %error,
+                    tool = %envelope.tool,
+                    turn_id = %envelope.turn_id,
+                    raw_arguments = ?envelope.arguments,
+                    "dynamic tool arguments failed to parse"
+                );
+                ClientError::from(error)
+            })?;
+
+        let default_target = self
+            .turn_contexts
+            .lock()
+            .await
+            .get(&envelope.turn_id)
+            .map(|context| context.operator_target)
+            .ok_or_else(|| {
+                ClientError::InvalidMessage(format!(
+                    "no operator target for turn {}",
+                    envelope.turn_id
+                ))
+            })?;
+        let target = OperatorTarget {
+            chat_id: arguments.operator_chat_id.unwrap_or(default_target.chat_id),
+            thread_id: arguments.operator_thread_id.or(default_target.thread_id),
+        };
+
+        let decision = self
+            .approvals
+            .request(
+                &self.config,
+                target,
+                &arguments.summary_markdown,
+                &arguments.proposed_reply,
+            )
+            .await
+            .map_err(|error| ClientError::InvalidMessage(error.to_string()))?;
+
+        let extra = match decision {
+            ApprovalOutcome::Approved => json!({
+                "success": true,
+                "decision": "approve",
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": "Operator approved the proposed action."
+                }]
+            }),
+            ApprovalOutcome::Denied => json!({
+                "success": true,
+                "decision": "deny",
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": "Operator denied the proposed action. Do not perform it unless they later change their mind."
+                }]
+            }),
+            ApprovalOutcome::Steer(message) => json!({
+                "success": true,
+                "decision": "steer",
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": format!(
+                        "Operator requested changes before approval. Do not send the previous draft. Revise it with these instructions:\n{}",
+                        message
+                    )
+                }]
+            }),
+        };
+
+        Ok(server_requests::DynamicToolCallResponse {
+            extra: serde_json::from_value(extra)?,
         })
     }
 
@@ -267,14 +390,18 @@ pub trait OutputSink: Send {
 
 #[async_trait]
 pub trait ChatTurnRunner: Send + Sync {
-    async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()>;
+    async fn reset_chat(&self, request: &ChatRequest) -> Result<()>;
 
     async fn run_chat_turn(
         &self,
-        inbound: InboundMessage,
+        request: ChatRequest,
         attachment: Option<DownloadedAttachment>,
         sink: &mut dyn OutputSink,
     ) -> Result<()>;
+
+    async fn ready(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -296,7 +423,7 @@ impl LiveThreadHandle for Thread {
 }
 
 impl CodexRuntime {
-    pub async fn start(config: &AppConfig) -> Result<Self> {
+    pub async fn start(config: &AppConfig, approvals: Arc<ApprovalManager>) -> Result<Self> {
         let server = Codex::start_ws_daemon(WsStartConfig {
             listen_url: config.codex.listen_url.clone(),
             connect_url: config.codex.connect_url.clone(),
@@ -308,7 +435,7 @@ impl CodexRuntime {
             CodexClient::connect_ws(WsConfig::default().with_url(config.codex.connect_url.clone()))
                 .await?;
         let codex = Codex::with_initialize_params(client, build_initialize_params(config));
-        let tool_router = Arc::new(DynamicToolRouter::new(config));
+        let tool_router = Arc::new(DynamicToolRouter::new(config, approvals));
         let tool_router_for_handler = tool_router.clone();
         codex
             .client()
@@ -325,7 +452,7 @@ impl CodexRuntime {
     }
 }
 
-fn spawn_proactive_auth_refresh_task(codex: Codex) {
+fn spawn_proactive_auth_refresh_task(codex: Codex) -> JoinHandle<()> {
     tokio::spawn(async move {
         match refresh_managed_chatgpt_auth(&codex).await {
             Ok(()) => {
@@ -358,7 +485,7 @@ fn spawn_proactive_auth_refresh_task(codex: Codex) {
                 }
             }
         }
-    });
+    })
 }
 
 async fn refresh_managed_chatgpt_auth(codex: &Codex) -> Result<()> {
@@ -429,34 +556,50 @@ impl ActiveChatTurn {
 }
 
 impl SessionManager {
-    pub async fn new(config: AppConfig) -> Result<Self> {
-        let runtime = CodexRuntime::start(&config).await?;
-        spawn_proactive_auth_refresh_task(runtime.codex.clone());
+    pub async fn new(config: AppConfig, approvals: Arc<ApprovalManager>) -> Result<Self> {
+        let runtime = Arc::new(CodexRuntime::start(&config, approvals.clone()).await?);
+        let auth_refresh_task = spawn_proactive_auth_refresh_task(runtime.codex.clone());
         let state = PersistentState::load(&config.sessions_path())?;
         Ok(Self {
-            runtime,
+            runtime: tokio::sync::RwLock::new(runtime),
+            approvals,
             sessions_path: config.sessions_path(),
             config,
             state: Mutex::new(state),
             chats: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashMap::new()),
             orchestrator: Mutex::new(None),
+            auth_refresh_task: Mutex::new(Some(auth_refresh_task)),
+            reconnect_lock: Mutex::new(()),
         })
     }
 
     pub async fn ensure_orchestrator(&self) -> Result<()> {
+        match self.ensure_orchestrator_once().await {
+            Ok(()) => Ok(()),
+            Err(error) if is_codex_transport_failure(&error) => {
+                self.reconnect_runtime("ensure_orchestrator", &error)
+                    .await?;
+                self.ensure_orchestrator_once().await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn ensure_orchestrator_once(&self) -> Result<()> {
         let mut orchestrator = self.orchestrator.lock().await;
         if orchestrator.is_some() {
             return Ok(());
         }
 
+        let runtime = self.runtime().await;
         let thread_id = self.state.lock().await.orchestrator_thread_id.clone();
         let thread = if let Some(thread_id) = thread_id {
-            self.runtime
+            runtime
                 .codex
                 .resume_thread_by_id(thread_id, self.base_thread_options())
         } else {
-            self.runtime.codex.start_thread(self.base_thread_options())
+            runtime.codex.start_thread(self.base_thread_options())
         };
 
         let arc = Arc::new(Mutex::new(thread));
@@ -480,12 +623,31 @@ impl SessionManager {
 
     pub async fn stream_chat_turn(
         &self,
-        inbound: InboundMessage,
+        request: ChatRequest,
         attachment: Option<DownloadedAttachment>,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
-        let key = chat_session_key(&inbound);
-        let input = self.build_input(&inbound, attachment);
+        match self
+            .stream_chat_turn_once(request.clone(), attachment.clone(), sink)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if is_codex_transport_failure(&error) => {
+                self.reconnect_runtime("stream_chat_turn", &error).await?;
+                self.stream_chat_turn_once(request, attachment, sink).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn stream_chat_turn_once(
+        &self,
+        request: ChatRequest,
+        attachment: Option<DownloadedAttachment>,
+        sink: &mut dyn OutputSink,
+    ) -> Result<()> {
+        let key = request.session_key.clone();
+        let input = self.build_input(&request, attachment);
 
         if self.try_steer_active_turn(&key, &input).await? {
             return Ok(());
@@ -510,7 +672,8 @@ impl SessionManager {
         drop(thread);
 
         let turn_params = self.build_live_turn_start_params(&thread_id, input);
-        let client = self.runtime.codex.client();
+        let runtime = self.runtime().await;
+        let client = runtime.codex.client();
         let mut server_events = client.subscribe();
         let (tx, mut rx) = mpsc::channel(512);
         let (tool_output_tx, mut tool_output_rx) = mpsc::channel(32);
@@ -569,9 +732,13 @@ impl SessionManager {
                     LiveTurnEvent::TurnStartResult(result) => {
                         let turn_id = result?;
                         active_turn_id = Some(turn_id.clone());
-                        self.runtime
+                        runtime
                             .tool_router
-                            .register_turn(&turn_id, tool_output_tx.clone())
+                            .register_turn(
+                                &turn_id,
+                                tool_output_tx.clone(),
+                                request.operator_target,
+                            )
                             .await;
                         let terminal = replay_buffered_notifications(
                             &buffered_notifications,
@@ -631,16 +798,28 @@ impl SessionManager {
         .await;
 
         if let Some(turn_id) = active_turn_id.as_deref() {
-            self.runtime.tool_router.unregister_turn(turn_id).await;
+            runtime.tool_router.unregister_turn(turn_id).await;
         }
         active_turn.mark_finished();
         self.remove_active_turn(&key, &active_turn).await;
         stream_result
     }
 
-    pub async fn reset_chat_thread(&self, inbound: &InboundMessage) -> Result<()> {
-        let key = chat_session_key(inbound);
-        let mut thread = self.runtime.codex.start_thread(self.base_thread_options());
+    pub async fn reset_chat_thread(&self, request: &ChatRequest) -> Result<()> {
+        match self.reset_chat_thread_once(request).await {
+            Ok(()) => Ok(()),
+            Err(error) if is_codex_transport_failure(&error) => {
+                self.reconnect_runtime("reset_chat_thread", &error).await?;
+                self.reset_chat_thread_once(request).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn reset_chat_thread_once(&self, request: &ChatRequest) -> Result<()> {
+        let key = request.session_key.clone();
+        let runtime = self.runtime().await;
+        let mut thread = runtime.codex.start_thread(self.base_thread_options());
         self.assign_chat_thread_name(&mut thread, &key).await?;
         let session = Arc::new(Mutex::new(thread));
 
@@ -649,17 +828,41 @@ impl SessionManager {
         Ok(())
     }
 
+    async fn codex_ready(&self) -> Result<()> {
+        match self.codex_ready_once().await {
+            Ok(()) => Ok(()),
+            Err(error) if is_codex_transport_failure(&error) => {
+                self.reconnect_runtime("readyz", &error).await?;
+                self.codex_ready_once().await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn codex_ready_once(&self) -> Result<()> {
+        let runtime = self.runtime().await;
+        runtime
+            .codex
+            .account_read(requests::GetAccountParams {
+                refresh_token: Some(false),
+                ..Default::default()
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn get_or_create_chat_thread(&self, key: &str) -> Result<Arc<Mutex<Thread>>> {
         if let Some(existing) = self.chats.lock().await.get(key).cloned() {
             return Ok(existing);
         }
 
+        let runtime = self.runtime().await;
         let thread = if let Some(thread_id) = self.find_chat_thread_id_by_name(key).await? {
-            self.runtime
+            runtime
                 .codex
                 .resume_thread_by_id(thread_id, self.base_thread_options())
         } else {
-            let mut thread = self.runtime.codex.start_thread(self.base_thread_options());
+            let mut thread = runtime.codex.start_thread(self.base_thread_options());
             self.assign_chat_thread_name(&mut thread, key).await?;
             thread
         };
@@ -708,7 +911,8 @@ impl SessionManager {
         if active.is_finished() {
             return Ok(());
         }
-        self.runtime
+        let runtime = self.runtime().await;
+        runtime
             .codex
             .client()
             .turn_steer(requests::TurnSteerParams {
@@ -722,8 +926,15 @@ impl SessionManager {
     }
 
     async fn find_chat_thread_id_by_name(&self, key: &str) -> Result<Option<String>> {
+        let path = codex_session_index_path()?;
         let thread_name = chat_thread_name(key);
-        find_thread_id_in_session_index(&codex_session_index_path()?, &thread_name)
+        if let Some(found) = find_thread_id_in_session_index(&path, &thread_name)? {
+            return Ok(Some(found));
+        }
+        if let Some(legacy) = legacy_telegram_thread_name(key) {
+            return find_thread_id_in_session_index(&path, &legacy);
+        }
+        Ok(None)
     }
 
     async fn assign_chat_thread_name(&self, thread: &mut Thread, key: &str) -> Result<String> {
@@ -743,19 +954,19 @@ impl SessionManager {
 
     fn build_input(
         &self,
-        inbound: &InboundMessage,
+        request: &ChatRequest,
         attachment: Option<DownloadedAttachment>,
     ) -> Input {
         match attachment {
             Some(DownloadedAttachment::Image(path)) => {
                 let mut items = Vec::new();
-                if let Some(text) = &inbound.text {
+                if let Some(text) = &request.text {
                     items.push(UserInput::Text { text: text.clone() });
                 } else {
                     items.push(UserInput::Text {
                         text: format!(
                             "User {} attached an image. Reply to them in the same chat.",
-                            inbound.sender_name
+                            request.sender_name
                         ),
                     });
                 }
@@ -773,12 +984,12 @@ impl SessionManager {
                     .map(|seconds| format!(" ({seconds}s)"))
                     .unwrap_or_default();
                 let mut prompt = format!(
-                    "Telegram user {} sent a voice message{}.\nLocal file path: `{}`.",
-                    inbound.sender_name,
+                    "User {} sent a voice message{}.\nLocal file path: `{}`.",
+                    request.sender_name,
                     duration,
                     path.display()
                 );
-                if let Some(caption) = inbound.text.as_ref().filter(|text| !text.trim().is_empty())
+                if let Some(caption) = request.text.as_ref().filter(|text| !text.trim().is_empty())
                 {
                     prompt.push_str("\nUser caption/context:\n");
                     prompt.push_str(caption.trim());
@@ -794,14 +1005,14 @@ impl SessionManager {
             }
             Some(DownloadedAttachment::File(path)) => {
                 let prompt = format!(
-                    "Telegram user {} sent a file.\nLocal file path: `{}`.\nUse that file directly if needed.\n\n{}",
-                    inbound.sender_name,
+                    "User {} sent a file.\nLocal file path: `{}`.\nUse that file directly if needed.\n\n{}",
+                    request.sender_name,
                     path.display(),
-                    inbound.text.clone().unwrap_or_default()
+                    request.text.clone().unwrap_or_default()
                 );
                 Input::text(prompt)
             }
-            None => Input::text(inbound.text.clone().unwrap_or_default()),
+            None => Input::text(request.text.clone().unwrap_or_default()),
         }
     }
 
@@ -812,7 +1023,10 @@ impl SessionManager {
             .network_access_enabled(self.config.codex.network_access_enabled)
             .web_search_enabled(self.config.codex.web_search_enabled)
             .web_search_mode(WebSearchMode::Live)
-            .dynamic_tools(vec![telegram_send_media_tool_spec()])
+            .dynamic_tools(vec![
+                telegram_send_media_tool_spec(),
+                telegram_request_approval_tool_spec(),
+            ])
             .additional_directories(self.additional_directories());
 
         if let Some(model) = &self.config.codex.model {
@@ -898,17 +1112,69 @@ impl SessionManager {
             extra,
         }
     }
-}
 
-fn chat_session_key(inbound: &InboundMessage) -> String {
-    match inbound.thread_id {
-        Some(thread_id) => format!("{}:{thread_id}", inbound.chat_id),
-        None => inbound.chat_id.to_string(),
+    async fn runtime(&self) -> Arc<CodexRuntime> {
+        self.runtime.read().await.clone()
+    }
+
+    async fn reconnect_runtime(&self, operation: &str, error: &anyhow::Error) -> Result<()> {
+        let _guard = self.reconnect_lock.lock().await;
+        warn!(
+            operation,
+            error = %error,
+            "reinitializing Codex runtime after transport failure"
+        );
+
+        let new_runtime =
+            Arc::new(CodexRuntime::start(&self.config, self.approvals.clone()).await?);
+        let new_auth_refresh_task = spawn_proactive_auth_refresh_task(new_runtime.codex.clone());
+
+        {
+            let mut runtime = self.runtime.write().await;
+            *runtime = new_runtime;
+        }
+
+        if let Some(handle) = self
+            .auth_refresh_task
+            .lock()
+            .await
+            .replace(new_auth_refresh_task)
+        {
+            handle.abort();
+        }
+
+        let active_turns = {
+            let mut active_turns = self.active_turns.lock().await;
+            std::mem::take(&mut *active_turns)
+        };
+        for active in active_turns.into_values() {
+            active.mark_finished();
+        }
+        self.chats.lock().await.clear();
+        *self.orchestrator.lock().await = None;
+
+        Ok(())
     }
 }
 
 fn chat_thread_name(key: &str) -> String {
-    format!("telegram:{key}")
+    format!("session:{key}")
+}
+
+fn legacy_telegram_thread_name(key: &str) -> Option<String> {
+    let remainder = key.strip_prefix("telegram:default:")?;
+    Some(format!("telegram:{remainder}"))
+}
+
+#[cfg(test)]
+fn chat_session_key(inbound: &InboundMessage) -> String {
+    EventRoute {
+        channel: ChannelKind::Telegram,
+        account_id: "default".to_string(),
+        conversation_id: inbound.chat_id.to_string(),
+        thread_id: inbound.thread_id.map(|value| value.to_string()),
+    }
+    .session_key()
 }
 
 fn codex_session_index_path() -> Result<PathBuf> {
@@ -945,19 +1211,34 @@ fn find_thread_id_in_session_index(path: &Path, thread_name: &str) -> Result<Opt
     Ok(found)
 }
 
+fn is_codex_transport_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("Codex event stream closed")
+            || message.contains("transport send failed")
+            || message.contains("channel closed")
+            || message.contains("request timed out")
+            || message.contains("connection not ready")
+    })
+}
+
 #[async_trait]
 impl ChatTurnRunner for SessionManager {
-    async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()> {
-        self.reset_chat_thread(inbound).await
+    async fn reset_chat(&self, request: &ChatRequest) -> Result<()> {
+        self.reset_chat_thread(request).await
     }
 
     async fn run_chat_turn(
         &self,
-        inbound: InboundMessage,
+        request: ChatRequest,
         attachment: Option<DownloadedAttachment>,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
-        self.stream_chat_turn(inbound, attachment, sink).await
+        self.stream_chat_turn(request, attachment, sink).await
+    }
+
+    async fn ready(&self) -> Result<()> {
+        self.codex_ready().await
     }
 }
 
@@ -1026,6 +1307,11 @@ fn should_forward_message(message: &AgentMessageItem) -> bool {
 
 impl Drop for SessionManager {
     fn drop(&mut self) {
+        if let Ok(mut auth_refresh_task) = self.auth_refresh_task.try_lock()
+            && let Some(handle) = auth_refresh_task.take()
+        {
+            handle.abort();
+        }
         if let Ok(state) = self.state.try_lock()
             && let Err(error) = state.save(&self.sessions_path)
         {
@@ -1286,6 +1572,36 @@ fn telegram_send_media_tool_spec() -> DynamicToolSpec {
     )
 }
 
+fn telegram_request_approval_tool_spec() -> DynamicToolSpec {
+    DynamicToolSpec::new(
+        "telegram_request_approval",
+        "Ask the configured Telegram operator to approve, deny, or steer a proposed action. Use this when a draft reply or sensitive action needs human approval before continuing. This tool blocks until the operator chooses Approve, Deny, or Steer and sends steering text.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["summary_markdown", "proposed_reply"],
+            "properties": {
+                "summary_markdown": {
+                    "type": "string",
+                    "description": "Short Markdown summary explaining what needs approval."
+                },
+                "proposed_reply": {
+                    "type": "string",
+                    "description": "Proposed outbound message text to show the operator."
+                },
+                "operator_chat_id": {
+                    "type": "integer",
+                    "description": "Optional Telegram chat id override for where to send the approval request."
+                },
+                "operator_thread_id": {
+                    "type": "integer",
+                    "description": "Optional Telegram message_thread_id override for where to send the approval request."
+                }
+            }
+        }),
+    )
+}
+
 fn parse_dynamic_tool_call_envelope(
     params: &server_requests::DynamicToolCallParams,
 ) -> std::result::Result<DynamicToolCallEnvelope, ClientError> {
@@ -1326,12 +1642,12 @@ fn parse_dynamic_tool_call_envelope(
     })
 }
 
-fn media_kind_label(kind: TelegramMediaKind) -> &'static str {
+fn media_kind_label(kind: MediaKind) -> &'static str {
     match kind {
-        TelegramMediaKind::Photo => "photo",
-        TelegramMediaKind::Document => "document",
-        TelegramMediaKind::Audio => "audio",
-        TelegramMediaKind::Voice => "voice note",
+        MediaKind::Photo => "photo",
+        MediaKind::Document => "document",
+        MediaKind::Audio => "audio",
+        MediaKind::Voice => "voice note",
     }
 }
 
@@ -1517,7 +1833,7 @@ fn parse_agent_message_phase_local(value: &str) -> AgentMessagePhase {
 mod tests {
     use super::*;
     use crate::config::{
-        AppConfig, AppPaths, CodexConfig, ServerConfig, TelegramConfig, VoiceConfig,
+        AppConfig, AppPaths, CodexConfig, OperatorConfig, ServerConfig, TelegramConfig, VoiceConfig,
     };
     use codex_app_server_sdk::protocol::notifications::DeltaNotification;
     use serde_json::json;
@@ -1763,6 +2079,8 @@ mod tests {
                 webhook_secret: "secret".to_string(),
                 api_base_url: "https://api.telegram.org".to_string(),
             },
+            whatsapp: None,
+            operator: OperatorConfig::default(),
             voice: VoiceConfig {
                 enabled: true,
                 transcriber_command: "parakeet-mlx".to_string(),
@@ -1814,7 +2132,7 @@ mod tests {
             args,
             TelegramSendMediaArgs {
                 path: "/tmp/report.txt".to_string(),
-                kind: TelegramMediaKind::Document,
+                kind: MediaKind::Document,
                 caption_markdown: Some("Attached report".to_string()),
                 file_name: None,
                 mime_type: None,
@@ -1877,7 +2195,7 @@ mod tests {
         std::fs::write(&file_path, b"pdf").expect("write file");
 
         let config = test_app_config(tempdir.path());
-        let router = DynamicToolRouter::new(&config);
+        let router = DynamicToolRouter::new(&config, ApprovalManager::new());
 
         let resolved = router
             .resolve_path("Documents/example.pdf")
@@ -2209,17 +2527,35 @@ mod tests {
             voice_file_id: None,
             voice_duration: None,
         };
-        assert_eq!(chat_session_key(&inbound), "42:9001");
+        assert_eq!(chat_session_key(&inbound), "telegram:default:42:9001");
 
         let mut root_inbound = inbound;
         root_inbound.thread_id = None;
-        assert_eq!(chat_session_key(&root_inbound), "42");
+        assert_eq!(chat_session_key(&root_inbound), "telegram:default:42");
     }
 
     #[test]
-    fn chat_thread_name_uses_stable_telegram_prefix() {
-        assert_eq!(chat_thread_name("42"), "telegram:42");
-        assert_eq!(chat_thread_name("42:9001"), "telegram:42:9001");
+    fn chat_thread_name_uses_generic_session_prefix() {
+        assert_eq!(
+            chat_thread_name("telegram:default:42"),
+            "session:telegram:default:42"
+        );
+        assert_eq!(
+            chat_thread_name("telegram:default:42:9001"),
+            "session:telegram:default:42:9001"
+        );
+    }
+
+    #[test]
+    fn legacy_telegram_thread_name_supports_existing_sessions() {
+        assert_eq!(
+            legacy_telegram_thread_name("telegram:default:42:9001").as_deref(),
+            Some("telegram:42:9001")
+        );
+        assert_eq!(
+            legacy_telegram_thread_name("telegram:default:42").as_deref(),
+            Some("telegram:42")
+        );
     }
 
     #[test]
@@ -2229,15 +2565,30 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"id\":\"thread-1\",\"thread_name\":\"telegram:42\",\"updated_at\":\"2026-03-27T10:00:00Z\"}\n",
-                "{\"id\":\"thread-2\",\"thread_name\":\"telegram:9\",\"updated_at\":\"2026-03-27T10:01:00Z\"}\n",
-                "{\"id\":\"thread-3\",\"thread_name\":\"telegram:42\",\"updated_at\":\"2026-03-27T10:02:00Z\"}\n",
-                "{\"id\":\"ignored\",\"thread_name\":\"telegram:42:extra\",\"updated_at\":\"2026-03-27T10:03:00Z\"}\n",
+                "{\"id\":\"thread-1\",\"thread_name\":\"session:telegram:default:42\",\"updated_at\":\"2026-03-27T10:00:00Z\"}\n",
+                "{\"id\":\"thread-2\",\"thread_name\":\"session:telegram:default:9\",\"updated_at\":\"2026-03-27T10:01:00Z\"}\n",
+                "{\"id\":\"thread-3\",\"thread_name\":\"session:telegram:default:42\",\"updated_at\":\"2026-03-27T10:02:00Z\"}\n",
+                "{\"id\":\"ignored\",\"thread_name\":\"session:telegram:default:42:extra\",\"updated_at\":\"2026-03-27T10:03:00Z\"}\n",
             ),
         )
         .expect("write session index");
 
-        let found = find_thread_id_in_session_index(&path, "telegram:42").expect("lookup");
+        let found =
+            find_thread_id_in_session_index(&path, "session:telegram:default:42").expect("lookup");
         assert_eq!(found.as_deref(), Some("thread-3"));
+    }
+
+    #[test]
+    fn detects_codex_transport_failures_from_error_text() {
+        assert!(is_codex_transport_failure(&anyhow!(
+            "Codex event stream closed"
+        )));
+        assert!(is_codex_transport_failure(&anyhow!(
+            "transport send failed: failed to send outbound frame: channel closed"
+        )));
+        assert!(!is_codex_transport_failure(&anyhow!(
+            "{}",
+            r#"rpc error RpcError { code: -32600, message: "no active turn to steer", data: None }"#
+        )));
     }
 }

@@ -2,20 +2,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Json, Router, response::IntoResponse};
 use serde_json::json;
 use tokio::signal;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use crate::codex::{ChatTurnRunner, OutputSink, SessionManager, TurnOutput};
+use crate::approval::ApprovalManager;
+use crate::channels::whatsapp::{
+    WhatsAppWebhookPayload, WhatsAppWebhookVerificationQuery, normalize_webhook_event,
+    verify_webhook,
+};
+use crate::channels::{ReplyTarget, TurnOutput, send_turn_output_to_target};
+use crate::codex::{ChatRequest, ChatTurnRunner, OutputSink, SessionManager};
 use crate::config::AppConfig;
 use crate::telegram::{
-    DownloadedAttachment, OutboundTelegramMedia, TelegramUpdate, download_attachment,
-    normalize_update, send_audio, send_document, send_markdown_message, send_photo, send_voice,
+    DownloadedAttachment, TelegramUpdate, download_attachment, normalize_update,
 };
 use crate::transcription::transcribe_voice_message;
 
@@ -23,6 +28,7 @@ use crate::transcription::transcribe_voice_message;
 struct AppState {
     config: Arc<RwLock<AppConfig>>,
     sessions: Arc<dyn ChatTurnRunner>,
+    approvals: Arc<ApprovalManager>,
 }
 
 pub async fn run(config: AppConfig) -> Result<()> {
@@ -32,19 +38,27 @@ pub async fn run(config: AppConfig) -> Result<()> {
         .parse()
         .with_context(|| format!("invalid server.listen `{}`", config.server.listen))?;
 
-    let sessions = Arc::new(SessionManager::new(config.clone()).await?);
+    let approvals = ApprovalManager::new();
+    let sessions = Arc::new(SessionManager::new(config.clone(), approvals.clone()).await?);
     sessions.ensure_orchestrator().await?;
 
     let state = AppState {
         config: Arc::new(RwLock::new(config.clone())),
         sessions,
+        approvals,
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(health))
-        .route("/readyz", get(health))
-        .route("/telegram/{secret}", post(telegram_webhook))
-        .with_state(state.clone());
+        .route("/readyz", get(ready))
+        .route("/telegram/{secret}", post(telegram_webhook));
+    if let Some(whatsapp) = config.whatsapp.as_ref() {
+        let path: &'static str = Box::leak(whatsapp.webhook_path.clone().into_boxed_str());
+        app = app
+            .route(path, get(whatsapp_webhook_verify))
+            .route(path, post(whatsapp_webhook));
+    }
+    let app = app.with_state(state.clone());
 
     #[cfg(unix)]
     spawn_reload_task(state.config.clone());
@@ -62,6 +76,56 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
+async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    match state.sessions.ready().await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn whatsapp_webhook_verify(
+    State(state): State<AppState>,
+    Query(query): Query<WhatsAppWebhookVerificationQuery>,
+) -> impl IntoResponse {
+    let config = state.config.read().await.clone();
+    let Some(whatsapp) = config.whatsapp.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match verify_webhook(whatsapp, &query) {
+        Some(challenge) => challenge.into_response(),
+        None => StatusCode::FORBIDDEN.into_response(),
+    }
+}
+
+async fn whatsapp_webhook(
+    State(state): State<AppState>,
+    Json(payload): Json<WhatsAppWebhookPayload>,
+) -> StatusCode {
+    let config = state.config.read().await.clone();
+    let Some(whatsapp) = config.whatsapp.as_ref() else {
+        return StatusCode::NOT_FOUND;
+    };
+    let Some(event) = normalize_webhook_event(whatsapp, &payload) else {
+        return StatusCode::OK;
+    };
+
+    let sessions = state.sessions.clone();
+    tokio::spawn(async move {
+        if let Err(error) = process_whatsapp_update(sessions.as_ref(), &config, event).await {
+            error!("failed to process WhatsApp update: {error}");
+        }
+    });
+
+    StatusCode::OK
+}
+
 async fn telegram_webhook(
     State(state): State<AppState>,
     AxumPath(secret): AxumPath<String>,
@@ -70,6 +134,19 @@ async fn telegram_webhook(
     let config = state.config.read().await.clone();
     if secret != config.telegram.webhook_secret {
         return StatusCode::NOT_FOUND;
+    }
+
+    match state
+        .approvals
+        .handle_update(&config, &update, &config.telegram.allowed_user_ids)
+        .await
+    {
+        Ok(true) => return StatusCode::OK,
+        Ok(false) => {}
+        Err(error) => {
+            error!("failed to process Telegram approval update: {error}");
+            return StatusCode::OK;
+        }
     }
 
     let Some(inbound) = normalize_update(&update, &config.telegram.allowed_user_ids) else {
@@ -95,13 +172,18 @@ async fn process_telegram_update(
     inbound: crate::telegram::InboundMessage,
 ) -> Result<()> {
     if inbound.requests_new_chat() {
-        runner.reset_chat(&inbound).await?;
-        send_markdown_message(
+        let request = ChatRequest::from_telegram(
+            inbound.clone(),
+            operator_target_for_telegram_inbound(config, &inbound),
+        );
+        runner.reset_chat(&request).await?;
+        send_turn_output_to_target(
             config,
-            inbound.chat_id,
-            inbound.thread_id,
-            false,
-            "Started a fresh chat. History cleared for this Telegram chat.",
+            &ReplyTarget::telegram(inbound.chat_id, inbound.thread_id),
+            TurnOutput::Markdown {
+                text: "Started a fresh chat. History cleared for this Telegram chat.".to_string(),
+                disable_notification: false,
+            },
         )
         .await?;
         return Ok(());
@@ -116,12 +198,13 @@ async fn process_telegram_update(
                 update_id = update.update_id,
                 "failed to download Telegram attachment: {error}"
             );
-            let _ = send_markdown_message(
+            let _ = send_turn_output_to_target(
                 config,
-                inbound.chat_id,
-                inbound.thread_id,
-                false,
-                &format!("Attachment download failed:\n\n```text\n{error}\n```"),
+                &ReplyTarget::telegram(inbound.chat_id, inbound.thread_id),
+                TurnOutput::Markdown {
+                    text: format!("Attachment download failed:\n\n```text\n{error}\n```"),
+                    disable_notification: false,
+                },
             )
             .await;
             return Ok(());
@@ -136,12 +219,13 @@ async fn process_telegram_update(
                 update_id = update.update_id,
                 "failed to transcribe Telegram voice message: {error}"
             );
-            let _ = send_markdown_message(
+            let _ = send_turn_output_to_target(
                 config,
-                inbound.chat_id,
-                inbound.thread_id,
-                false,
-                &format!("Voice transcription failed:\n\n```text\n{error}\n```"),
+                &ReplyTarget::telegram(inbound.chat_id, inbound.thread_id),
+                TurnOutput::Markdown {
+                    text: format!("Voice transcription failed:\n\n```text\n{error}\n```"),
+                    disable_notification: false,
+                },
             )
             .await;
             return Ok(());
@@ -151,27 +235,77 @@ async fn process_telegram_update(
     let chat_id = inbound.chat_id;
     let thread_id = inbound.thread_id;
     let message_id = inbound.message_id;
-    let mut sink = TelegramSink {
-        config: config.clone(),
-        chat_id,
-        thread_id,
-    };
+    let request = ChatRequest::from_telegram(
+        inbound.clone(),
+        operator_target_for_telegram_inbound(config, &inbound),
+    );
+    let mut sink = RoutedSink::new(
+        config.clone(),
+        ReplyTarget::telegram(inbound.chat_id, inbound.thread_id),
+    );
 
-    match runner.run_chat_turn(inbound, attachment, &mut sink).await {
+    match runner.run_chat_turn(request, attachment, &mut sink).await {
         Ok(()) => Ok(()),
         Err(error) => {
             error!(chat_id, message_id, "Codex turn failed: {error}");
-            let _ = send_markdown_message(
+            let _ = send_turn_output_to_target(
                 config,
-                chat_id,
-                thread_id,
-                false,
-                &format!("Turn failed:\n\n```text\n{error}\n```"),
+                &ReplyTarget::telegram(chat_id, thread_id),
+                TurnOutput::Markdown {
+                    text: format!("Turn failed:\n\n```text\n{error}\n```"),
+                    disable_notification: false,
+                },
             )
             .await;
             Ok(())
         }
     }
+}
+
+fn operator_target_for_telegram_inbound(
+    config: &AppConfig,
+    inbound: &crate::telegram::InboundMessage,
+) -> crate::approval::OperatorTarget {
+    if let Some(target) = config.operator.telegram.as_ref() {
+        return crate::approval::OperatorTarget {
+            chat_id: target.chat_id,
+            thread_id: target.thread_id,
+        };
+    }
+    crate::approval::OperatorTarget {
+        chat_id: inbound.chat_id,
+        thread_id: inbound.thread_id,
+    }
+}
+
+fn operator_target_for_whatsapp(config: &AppConfig) -> crate::approval::OperatorTarget {
+    if let Some(target) = config.operator.telegram.as_ref() {
+        return crate::approval::OperatorTarget {
+            chat_id: target.chat_id,
+            thread_id: target.thread_id,
+        };
+    }
+    crate::approval::OperatorTarget {
+        chat_id: 0,
+        thread_id: None,
+    }
+}
+
+async fn process_whatsapp_update(
+    runner: &dyn ChatTurnRunner,
+    config: &AppConfig,
+    event: crate::channels::whatsapp::WhatsAppInboundEvent,
+) -> Result<()> {
+    let session_key = event.session_key();
+    let reply_target = ReplyTarget::WhatsApp(event.reply_target());
+    let request = ChatRequest {
+        session_key,
+        sender_name: event.sender_name.clone(),
+        text: Some(event.text.clone()),
+        operator_target: operator_target_for_whatsapp(config),
+    };
+    let mut sink = RoutedSink::new(config.clone(), reply_target);
+    runner.run_chat_turn(request, None, &mut sink).await
 }
 
 async fn maybe_transcribe_voice_attachment(
@@ -220,59 +354,21 @@ async fn maybe_transcribe_voice_attachment(
     }))
 }
 
-struct TelegramSink {
+struct RoutedSink {
     config: AppConfig,
-    chat_id: i64,
-    thread_id: Option<i64>,
+    target: ReplyTarget,
+}
+
+impl RoutedSink {
+    fn new(config: AppConfig, target: ReplyTarget) -> Self {
+        Self { config, target }
+    }
 }
 
 #[async_trait::async_trait]
-impl OutputSink for TelegramSink {
+impl OutputSink for RoutedSink {
     async fn send(&mut self, output: TurnOutput) -> Result<()> {
-        match output {
-            TurnOutput::Markdown {
-                text,
-                disable_notification,
-            } => {
-                send_markdown_message(
-                    &self.config,
-                    self.chat_id,
-                    self.thread_id,
-                    disable_notification,
-                    &text,
-                )
-                .await
-            }
-            TurnOutput::Media {
-                kind,
-                path,
-                caption_markdown,
-                file_name,
-                mime_type,
-                disable_notification,
-            } => {
-                let caption_html = caption_markdown
-                    .as_deref()
-                    .map(crate::markdown::markdown_to_telegram_html);
-                let media = OutboundTelegramMedia {
-                    chat_id: self.chat_id,
-                    thread_id: self.thread_id,
-                    path: &path,
-                    disable_notification,
-                    caption_html: caption_html.as_deref(),
-                    file_name_override: file_name.as_deref(),
-                    mime_type_override: mime_type.as_deref(),
-                };
-                match kind {
-                    crate::codex::TelegramMediaKind::Photo => send_photo(&self.config, media).await,
-                    crate::codex::TelegramMediaKind::Document => {
-                        send_document(&self.config, media).await
-                    }
-                    crate::codex::TelegramMediaKind::Audio => send_audio(&self.config, media).await,
-                    crate::codex::TelegramMediaKind::Voice => send_voice(&self.config, media).await,
-                }
-            }
-        }
+        send_turn_output_to_target(&self.config, &self.target, output).await
     }
 }
 
@@ -343,12 +439,14 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
-    use crate::codex::TurnOutput;
+    use crate::approval::{ApprovalManager, ApprovalOutcome, OperatorTarget};
+    use crate::channels::TurnOutput;
     use crate::config::{
-        AppConfig, AppPaths, CodexConfig, ServerConfig, TelegramConfig, VoiceConfig,
+        AppConfig, AppPaths, CodexConfig, OperatorConfig, OperatorTelegramConfig, ServerConfig,
+        TelegramConfig, VoiceConfig,
     };
     use crate::telegram::{
-        DownloadedAttachment, InboundMessage, TelegramChat, TelegramMessage, TelegramUpdate,
+        DownloadedAttachment, TelegramCallbackQuery, TelegramChat, TelegramMessage, TelegramUpdate,
         TelegramUser, TelegramVoice, normalize_update,
     };
 
@@ -371,13 +469,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChatTurnRunner for FakeTurnRunner {
-        async fn reset_chat(&self, _inbound: &InboundMessage) -> Result<()> {
+        async fn reset_chat(&self, _request: &ChatRequest) -> Result<()> {
             Ok(())
         }
 
         async fn run_chat_turn(
             &self,
-            _inbound: InboundMessage,
+            _request: ChatRequest,
             _attachment: Option<DownloadedAttachment>,
             sink: &mut dyn OutputSink,
         ) -> Result<()> {
@@ -390,23 +488,23 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingRunner {
-        inbound: Arc<Mutex<Vec<InboundMessage>>>,
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
         attachments: Arc<Mutex<Vec<Option<DownloadedAttachment>>>>,
     }
 
     #[async_trait::async_trait]
     impl ChatTurnRunner for CapturingRunner {
-        async fn reset_chat(&self, _inbound: &InboundMessage) -> Result<()> {
+        async fn reset_chat(&self, _request: &ChatRequest) -> Result<()> {
             Ok(())
         }
 
         async fn run_chat_turn(
             &self,
-            inbound: InboundMessage,
+            request: ChatRequest,
             attachment: Option<DownloadedAttachment>,
             _sink: &mut dyn OutputSink,
         ) -> Result<()> {
-            self.inbound.lock().await.push(inbound);
+            self.requests.lock().await.push(request);
             self.attachments.lock().await.push(attachment);
             Ok(())
         }
@@ -475,6 +573,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_callbacks_resolve_pending_request_as_approved() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let approvals = ApprovalManager::new();
+        let target = OperatorTarget {
+            chat_id: 100,
+            thread_id: Some(777),
+        };
+
+        let pending = {
+            let approvals = approvals.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(&config, target, "Need approval", "Draft reply")
+                    .await
+            })
+        };
+
+        let callback_data = loop {
+            let requests = mock.requests().await;
+            if let Some(send_message) = requests
+                .iter()
+                .find(|req| req.path.ends_with("/sendMessage"))
+            {
+                let body: Value =
+                    serde_json::from_slice(&send_message.body).expect("sendMessage json");
+                let data = body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+                    .as_str()
+                    .expect("approve callback data");
+                break data.to_string();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        let handled = approvals
+            .handle_update(
+                &config,
+                &TelegramUpdate {
+                    update_id: 999,
+                    message: None,
+                    edited_message: None,
+                    callback_query: Some(TelegramCallbackQuery {
+                        id: "cb-1".to_string(),
+                        from: TelegramUser {
+                            id: 42,
+                            first_name: Some("Test".to_string()),
+                            last_name: None,
+                        },
+                        message: Some(TelegramMessage {
+                            message_id: 500,
+                            chat: TelegramChat { id: 100 },
+                            from: Some(TelegramUser {
+                                id: 42,
+                                first_name: Some("Test".to_string()),
+                                last_name: None,
+                            }),
+                            sender_chat: None,
+                            text: Some("approval".to_string()),
+                            caption: None,
+                            photo: None,
+                            document: None,
+                            voice: None,
+                            message_thread_id: Some(777),
+                        }),
+                        data: Some(callback_data),
+                    }),
+                },
+                &[42],
+            )
+            .await?;
+
+        assert!(handled);
+        assert_eq!(pending.await??, ApprovalOutcome::Approved);
+
+        let requests = mock.requests().await;
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path.ends_with("/answerCallbackQuery"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path.ends_with("/editMessageReplyMarkup"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_steer_consumes_next_operator_message() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let approvals = ApprovalManager::new();
+        let target = OperatorTarget {
+            chat_id: 100,
+            thread_id: Some(777),
+        };
+
+        let pending = {
+            let approvals = approvals.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(&config, target, "Need approval", "Draft reply")
+                    .await
+            })
+        };
+
+        let steer_callback_data = loop {
+            let requests = mock.requests().await;
+            if let Some(send_message) = requests
+                .iter()
+                .find(|req| req.path.ends_with("/sendMessage"))
+            {
+                let body: Value =
+                    serde_json::from_slice(&send_message.body).expect("sendMessage json");
+                let data = body["reply_markup"]["inline_keyboard"][0][2]["callback_data"]
+                    .as_str()
+                    .expect("steer callback data");
+                break data.to_string();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        assert!(
+            approvals
+                .handle_update(
+                    &config,
+                    &TelegramUpdate {
+                        update_id: 1000,
+                        message: None,
+                        edited_message: None,
+                        callback_query: Some(TelegramCallbackQuery {
+                            id: "cb-2".to_string(),
+                            from: TelegramUser {
+                                id: 42,
+                                first_name: Some("Test".to_string()),
+                                last_name: None,
+                            },
+                            message: Some(TelegramMessage {
+                                message_id: 500,
+                                chat: TelegramChat { id: 100 },
+                                from: Some(TelegramUser {
+                                    id: 42,
+                                    first_name: Some("Test".to_string()),
+                                    last_name: None,
+                                }),
+                                sender_chat: None,
+                                text: Some("approval".to_string()),
+                                caption: None,
+                                photo: None,
+                                document: None,
+                                voice: None,
+                                message_thread_id: Some(777),
+                            }),
+                            data: Some(steer_callback_data),
+                        }),
+                    },
+                    &[42],
+                )
+                .await?
+        );
+
+        assert!(
+            approvals
+                .handle_update(
+                    &config,
+                    &TelegramUpdate {
+                        update_id: 1001,
+                        message: Some(TelegramMessage {
+                            message_id: 33,
+                            chat: TelegramChat { id: 100 },
+                            from: Some(TelegramUser {
+                                id: 42,
+                                first_name: Some("Test".to_string()),
+                                last_name: None,
+                            }),
+                            sender_chat: None,
+                            text: Some("Make it shorter".to_string()),
+                            caption: None,
+                            photo: None,
+                            document: None,
+                            voice: None,
+                            message_thread_id: Some(777),
+                        }),
+                        edited_message: None,
+                        callback_query: None,
+                    },
+                    &[42],
+                )
+                .await?
+        );
+
+        assert_eq!(
+            pending.await??,
+            ApprovalOutcome::Steer("Make it shorter".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn process_update_routes_media_outputs_through_telegram_tooling() -> Result<()> {
         let mock = start_mock_telegram_api().await?;
         let tempdir = TempDir::new()?;
@@ -485,7 +787,7 @@ mod tests {
         std::fs::write(&file_path, "report-body")?;
         let runner = FakeTurnRunner {
             scripted_outputs: vec![TurnOutput::Media {
-                kind: crate::codex::TelegramMediaKind::Document,
+                kind: crate::channels::MediaKind::Document,
                 path: file_path,
                 caption_markdown: Some("Attached report".to_string()),
                 file_name: Some("final-report.txt".to_string()),
@@ -552,17 +854,17 @@ mod tests {
 
         #[async_trait::async_trait]
         impl ChatTurnRunner for ResettableRunner {
-            async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()> {
+            async fn reset_chat(&self, request: &ChatRequest) -> Result<()> {
                 self.resets
                     .lock()
                     .await
-                    .push((inbound.chat_id, inbound.thread_id));
+                    .push(telegram_target_from_session_key(&request.session_key));
                 Ok(())
             }
 
             async fn run_chat_turn(
                 &self,
-                _inbound: InboundMessage,
+                _request: ChatRequest,
                 _attachment: Option<DownloadedAttachment>,
                 _sink: &mut dyn OutputSink,
             ) -> Result<()> {
@@ -609,17 +911,17 @@ mod tests {
 
         #[async_trait::async_trait]
         impl ChatTurnRunner for ResettableRunner {
-            async fn reset_chat(&self, inbound: &InboundMessage) -> Result<()> {
+            async fn reset_chat(&self, request: &ChatRequest) -> Result<()> {
                 self.resets
                     .lock()
                     .await
-                    .push((inbound.chat_id, inbound.thread_id));
+                    .push(telegram_target_from_session_key(&request.session_key));
                 Ok(())
             }
 
             async fn run_chat_turn(
                 &self,
-                _inbound: InboundMessage,
+                _request: ChatRequest,
                 _attachment: Option<DownloadedAttachment>,
                 _sink: &mut dyn OutputSink,
             ) -> Result<()> {
@@ -694,9 +996,9 @@ mod tests {
 
         process_telegram_update(&runner, &config, update, inbound).await?;
 
-        let inbounds = runner.inbound.lock().await;
-        assert_eq!(inbounds.len(), 1);
-        assert_eq!(inbounds[0].text, None);
+        let requests = runner.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].text, None);
 
         let attachments = runner.attachments.lock().await;
         match attachments[0].as_ref().expect("attachment") {
@@ -727,7 +1029,7 @@ mod tests {
         let mock = start_mock_telegram_api().await?;
         let tempdir = TempDir::new()?;
         let config = live_e2e_config(tempdir.path(), &mock.base_url)?;
-        let sessions = SessionManager::new(config.clone()).await?;
+        let sessions = SessionManager::new(config.clone(), ApprovalManager::new()).await?;
         sessions.ensure_orchestrator().await?;
 
         let update = sample_update_with_text(
@@ -795,7 +1097,7 @@ mod tests {
         let mock = start_mock_telegram_api().await?;
         let tempdir = TempDir::new()?;
         let config = live_e2e_config(tempdir.path(), &mock.base_url)?;
-        let sessions = SessionManager::new(config.clone()).await?;
+        let sessions = SessionManager::new(config.clone(), ApprovalManager::new()).await?;
         sessions.ensure_orchestrator().await?;
 
         let update = sample_update_with_text(
@@ -850,7 +1152,7 @@ mod tests {
         let tempdir = TempDir::new()?;
         let config = live_e2e_config(tempdir.path(), &mock.base_url)?;
 
-        let sessions = SessionManager::new(config.clone()).await?;
+        let sessions = SessionManager::new(config.clone(), ApprovalManager::new()).await?;
         sessions.ensure_orchestrator().await?;
         let alpha_store = sample_group_thread_update_with_text(
             "For this Telegram thread only, remember the token ALPHA_THREAD_ONLY. Do not mention any other thread. Reply with exactly STORED_ALPHA and nothing else.",
@@ -859,7 +1161,7 @@ mod tests {
         let inbound = normalize_update(&alpha_store, &[42]).expect("inbound");
         process_telegram_update(&sessions, &config, alpha_store, inbound).await?;
 
-        let sessions = SessionManager::new(config.clone()).await?;
+        let sessions = SessionManager::new(config.clone(), ApprovalManager::new()).await?;
         sessions.ensure_orchestrator().await?;
         let beta_check = sample_group_thread_update_with_text(
             "Reply with exactly THREAD_BETA_EMPTY if this Telegram thread has not yet been told any token. Do not guess and do not mention other threads.",
@@ -868,7 +1170,7 @@ mod tests {
         let inbound = normalize_update(&beta_check, &[42]).expect("inbound");
         process_telegram_update(&sessions, &config, beta_check, inbound).await?;
 
-        let sessions = SessionManager::new(config.clone()).await?;
+        let sessions = SessionManager::new(config.clone(), ApprovalManager::new()).await?;
         sessions.ensure_orchestrator().await?;
         let alpha_recall = sample_group_thread_update_with_text(
             "Reply with exactly ALPHA_THREAD_ONLY if you remember the token previously stored in this same Telegram thread.",
@@ -936,6 +1238,13 @@ mod tests {
                 webhook_secret: "secret".to_string(),
                 api_base_url: api_base_url.to_string(),
             },
+            whatsapp: None,
+            operator: OperatorConfig {
+                telegram: Some(OperatorTelegramConfig {
+                    chat_id: 100,
+                    thread_id: Some(777),
+                }),
+            },
             voice: VoiceConfig {
                 enabled: true,
                 transcriber_command: "parakeet-mlx".to_string(),
@@ -982,6 +1291,7 @@ mod tests {
                 message_thread_id: None,
             }),
             edited_message: None,
+            callback_query: None,
         }
     }
 
@@ -1036,6 +1346,7 @@ mod tests {
                 message_thread_id: None,
             }),
             edited_message: None,
+            callback_query: None,
         }
     }
 
@@ -1059,7 +1370,24 @@ mod tests {
                 message_thread_id: Some(thread_id),
             }),
             edited_message: None,
+            callback_query: None,
         }
+    }
+
+    fn telegram_target_from_session_key(session_key: &str) -> (i64, Option<i64>) {
+        let rest = session_key
+            .strip_prefix("telegram:default:")
+            .expect("telegram session key");
+        let mut parts = rest.split(':');
+        let chat_id = parts
+            .next()
+            .expect("chat id")
+            .parse::<i64>()
+            .expect("chat id int");
+        let thread_id = parts
+            .next()
+            .map(|value| value.parse::<i64>().expect("thread id int"));
+        (chat_id, thread_id)
     }
 
     struct MockTelegramApi {
@@ -1085,6 +1413,8 @@ mod tests {
             });
             if uri.path().ends_with("/getFile") {
                 Json(json!({ "ok": true, "result": { "file_path": "voice/file.ogg" } }))
+            } else if uri.path().ends_with("/sendMessage") {
+                Json(json!({ "ok": true, "result": { "message_id": 500 } }))
             } else {
                 Json(json!({ "ok": true, "result": {} }))
             }
