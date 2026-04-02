@@ -54,6 +54,8 @@ pub struct ChatRequest {
     pub session_key: String,
     pub sender_name: String,
     pub text: Option<String>,
+    pub reply_to_text: Option<String>,
+    pub quoted_text: Option<String>,
     pub operator_target: OperatorTarget,
 }
 
@@ -70,6 +72,8 @@ impl ChatRequest {
             session_key,
             sender_name: inbound.sender_name,
             text: inbound.text,
+            reply_to_text: inbound.reply_to_text,
+            quoted_text: inbound.quoted_text,
             operator_target,
         }
     }
@@ -1022,10 +1026,11 @@ impl SessionManager {
         request: &ChatRequest,
         attachment: Option<DownloadedAttachment>,
     ) -> Input {
+        let text_with_context = compose_message_context(request);
         match attachment {
             Some(DownloadedAttachment::Image(path)) => {
                 let mut items = Vec::new();
-                if let Some(text) = &request.text {
+                if let Some(text) = &text_with_context {
                     items.push(UserInput::Text { text: text.clone() });
                 } else {
                     items.push(UserInput::Text {
@@ -1054,7 +1059,9 @@ impl SessionManager {
                     duration,
                     path.display()
                 );
-                if let Some(caption) = request.text.as_ref().filter(|text| !text.trim().is_empty())
+                if let Some(caption) = text_with_context
+                    .as_ref()
+                    .filter(|text| !text.trim().is_empty())
                 {
                     prompt.push_str("\nUser caption/context:\n");
                     prompt.push_str(caption.trim());
@@ -1073,11 +1080,11 @@ impl SessionManager {
                     "User {} sent a file.\nLocal file path: `{}`.\nUse that file directly if needed.\n\n{}",
                     request.sender_name,
                     path.display(),
-                    request.text.clone().unwrap_or_default()
+                    text_with_context.clone().unwrap_or_default()
                 );
                 Input::text(prompt)
             }
-            None => Input::text(request.text.clone().unwrap_or_default()),
+            None => Input::text(text_with_context.unwrap_or_default()),
         }
     }
 
@@ -1201,6 +1208,45 @@ impl SessionManager {
 
 fn chat_thread_name(key: &str) -> String {
     format!("session:{key}")
+}
+
+fn compose_message_context(request: &ChatRequest) -> Option<String> {
+    let user_text = request
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let reply_to_text = request
+        .reply_to_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let quoted_text = request
+        .quoted_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+
+    if reply_to_text.is_none() && quoted_text.is_none() {
+        return user_text.map(ToOwned::to_owned);
+    }
+
+    let mut parts = Vec::new();
+    if let Some(reply_to_text) = reply_to_text {
+        parts.push(format!("Quoted message:\n{reply_to_text}"));
+    }
+    if let Some(quoted_text) = quoted_text {
+        parts.push(format!("Quoted fragment:\n{quoted_text}"));
+    }
+    if let Some(user_text) = user_text {
+        parts.push(format!("User reply/comment:\n{user_text}"));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
 }
 
 fn legacy_telegram_thread_name(key: &str) -> Option<String> {
@@ -2568,6 +2614,8 @@ mod tests {
             message_id: 10,
             thread_id: Some(9001),
             text: Some("hello".to_string()),
+            reply_to_text: None,
+            quoted_text: None,
             image_file_id: None,
             document_file_id: None,
             document_name: None,
@@ -2623,6 +2671,26 @@ mod tests {
         let found =
             find_thread_id_in_session_index(&path, "session:telegram:default:42").expect("lookup");
         assert_eq!(found.as_deref(), Some("thread-3"));
+    }
+
+    #[test]
+    fn compose_message_context_includes_reply_and_quote() {
+        let request = ChatRequest {
+            session_key: "telegram:default:42".to_string(),
+            sender_name: "User".to_string(),
+            text: Some("new reply".to_string()),
+            reply_to_text: Some("full original".to_string()),
+            quoted_text: Some("selected bit".to_string()),
+            operator_target: OperatorTarget {
+                chat_id: 1,
+                thread_id: None,
+            },
+        };
+
+        let context = compose_message_context(&request).expect("context");
+        assert!(context.contains("Quoted message:\nfull original"));
+        assert!(context.contains("Quoted fragment:\nselected bit"));
+        assert!(context.contains("User reply/comment:\nnew reply"));
     }
 
     #[test]

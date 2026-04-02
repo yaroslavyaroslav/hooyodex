@@ -15,6 +15,7 @@ pub struct TelegramUpdate {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
     pub edited_message: Option<TelegramMessage>,
+    pub callback_query: Option<TelegramCallbackQuery>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -29,6 +30,9 @@ pub struct TelegramMessage {
     pub document: Option<TelegramDocument>,
     pub voice: Option<TelegramVoice>,
     pub message_thread_id: Option<i64>,
+    pub reply_to_message: Option<Box<TelegramMessage>>,
+    #[serde(alias = "text_quote")]
+    pub quote: Option<TelegramTextQuote>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -41,6 +45,14 @@ pub struct TelegramUser {
     pub id: i64,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramCallbackQuery {
+    pub id: String,
+    pub from: TelegramUser,
+    pub message: Option<TelegramMessage>,
+    pub data: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -66,6 +78,11 @@ pub struct TelegramDocument {
     pub file_name: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramTextQuote {
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
     pub chat_id: i64,
@@ -74,6 +91,8 @@ pub struct InboundMessage {
     pub message_id: i64,
     pub thread_id: Option<i64>,
     pub text: Option<String>,
+    pub reply_to_text: Option<String>,
+    pub quoted_text: Option<String>,
     pub image_file_id: Option<String>,
     pub document_file_id: Option<String>,
     pub document_name: Option<String>,
@@ -173,6 +192,15 @@ pub fn normalize_update(update: &TelegramUpdate, allowed_users: &[i64]) -> Optio
         message_id: message.message_id,
         thread_id: message.message_thread_id,
         text: message.text.clone().or_else(|| message.caption.clone()),
+        reply_to_text: message
+            .reply_to_message
+            .as_deref()
+            .and_then(|message| message.text.clone().or_else(|| message.caption.clone())),
+        quoted_text: message
+            .quote
+            .as_ref()
+            .map(|quote| quote.text.clone())
+            .filter(|text| !text.trim().is_empty()),
         image_file_id,
         document_file_id,
         document_name: message
@@ -252,6 +280,89 @@ pub async fn send_markdown_message(
             let text = response.text().await.unwrap_or_default();
             bail!("Telegram sendMessage failed: {}", text);
         }
+    }
+    Ok(())
+}
+
+pub async fn send_markdown_message_with_inline_keyboard(
+    config: &AppConfig,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    disable_notification: bool,
+    markdown: &str,
+    reply_markup: serde_json::Value,
+) -> Result<i64> {
+    let client = Client::new();
+    let url = format!(
+        "{}/bot{}/sendMessage",
+        config.telegram.api_base_url.trim_end_matches('/'),
+        config.telegram.bot_token
+    );
+    let html = sanitize_telegram_html(&markdown_to_telegram_html(markdown));
+    let mut body = json!({
+        "chat_id": chat_id,
+        "text": html,
+        "parse_mode": "HTML",
+        "disable_notification": disable_notification,
+        "reply_markup": reply_markup,
+    });
+    if let Some(thread_id) = thread_id {
+        body["message_thread_id"] = json!(thread_id);
+    }
+    let response: serde_json::Value = client.post(&url).json(&body).send().await?.json().await?;
+    if response["ok"].as_bool() != Some(true) {
+        bail!("Telegram sendMessage failed: {}", response);
+    }
+    response["result"]["message_id"]
+        .as_i64()
+        .context("Telegram sendMessage missing result.message_id")
+}
+
+pub async fn answer_callback_query(
+    config: &AppConfig,
+    callback_query_id: &str,
+    text: Option<&str>,
+    show_alert: bool,
+) -> Result<()> {
+    let client = Client::new();
+    let url = format!(
+        "{}/bot{}/answerCallbackQuery",
+        config.telegram.api_base_url.trim_end_matches('/'),
+        config.telegram.bot_token
+    );
+    let mut body = json!({
+        "callback_query_id": callback_query_id,
+        "show_alert": show_alert,
+    });
+    if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
+        body["text"] = json!(text);
+    }
+    let response: serde_json::Value = client.post(&url).json(&body).send().await?.json().await?;
+    if response["ok"].as_bool() != Some(true) {
+        bail!("Telegram answerCallbackQuery failed: {}", response);
+    }
+    Ok(())
+}
+
+pub async fn edit_message_reply_markup_remove(
+    config: &AppConfig,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<()> {
+    let client = Client::new();
+    let url = format!(
+        "{}/bot{}/editMessageReplyMarkup",
+        config.telegram.api_base_url.trim_end_matches('/'),
+        config.telegram.bot_token
+    );
+    let body = json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": { "inline_keyboard": [] }
+    });
+    let response: serde_json::Value = client.post(&url).json(&body).send().await?.json().await?;
+    if response["ok"].as_bool() != Some(true) {
+        bail!("Telegram editMessageReplyMarkup failed: {}", response);
     }
     Ok(())
 }
@@ -475,6 +586,8 @@ mod tests {
             document: None,
             voice: None,
             message_thread_id: None,
+            reply_to_message: None,
+            quote: None,
         }
     }
 
@@ -484,6 +597,7 @@ mod tests {
             update_id: 1,
             message: Some(sample_message()),
             edited_message: None,
+            callback_query: None,
         };
         assert!(normalize_update(&update, &[999]).is_none());
     }
@@ -500,6 +614,7 @@ mod tests {
             update_id: 1,
             message: Some(message),
             edited_message: None,
+            callback_query: None,
         };
         let inbound = normalize_update(&update, &[42]).expect("inbound");
         assert_eq!(inbound.document_file_id.as_deref(), Some("doc-1"));
@@ -526,6 +641,7 @@ mod tests {
                 update_id: 1,
                 message: Some(sample_message()),
                 edited_message: None,
+                callback_query: None,
             },
             &[42],
         )
@@ -539,6 +655,7 @@ mod tests {
                 update_id: 2,
                 message: Some(command_message),
                 edited_message: None,
+                callback_query: None,
             },
             &[42],
         )
@@ -552,6 +669,7 @@ mod tests {
                 update_id: 3,
                 message: Some(russian_command_message),
                 edited_message: None,
+                callback_query: None,
             },
             &[42],
         )
@@ -567,9 +685,50 @@ mod tests {
             update_id: 1,
             message: Some(message),
             edited_message: None,
+            callback_query: None,
         };
 
         let inbound = normalize_update(&update, &[42]).expect("inbound");
         assert_eq!(inbound.thread_id, Some(777));
+    }
+
+    #[test]
+    fn normalize_update_extracts_reply_to_message_text() {
+        let mut message = sample_message();
+        message.text = Some("follow-up".to_string());
+        message.reply_to_message = Some(Box::new(TelegramMessage {
+            text: Some("original message".to_string()),
+            caption: None,
+            ..sample_message()
+        }));
+        let update = TelegramUpdate {
+            update_id: 4,
+            message: Some(message),
+            edited_message: None,
+            callback_query: None,
+        };
+
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        assert_eq!(inbound.reply_to_text.as_deref(), Some("original message"));
+        assert_eq!(inbound.text.as_deref(), Some("follow-up"));
+    }
+
+    #[test]
+    fn normalize_update_extracts_quoted_fragment() {
+        let mut message = sample_message();
+        message.text = Some("my answer".to_string());
+        message.quote = Some(TelegramTextQuote {
+            text: "selected words".to_string(),
+        });
+        let update = TelegramUpdate {
+            update_id: 5,
+            message: Some(message),
+            edited_message: None,
+            callback_query: None,
+        };
+
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        assert_eq!(inbound.quoted_text.as_deref(), Some("selected words"));
+        assert_eq!(inbound.text.as_deref(), Some("my answer"));
     }
 }
