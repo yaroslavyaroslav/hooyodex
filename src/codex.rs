@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -39,7 +39,7 @@ const PROACTIVE_AUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 
 pub struct SessionManager {
     runtime: tokio::sync::RwLock<Arc<CodexRuntime>>,
     approvals: Arc<ApprovalManager>,
-    config: AppConfig,
+    config: RwLock<AppConfig>,
     sessions_path: PathBuf,
     state: Mutex<PersistentState>,
     chats: Mutex<HashMap<String, Arc<Mutex<Thread>>>>,
@@ -402,6 +402,10 @@ pub trait ChatTurnRunner: Send + Sync {
     async fn ready(&self) -> Result<()> {
         Ok(())
     }
+
+    async fn reload_config(&self, _config: AppConfig) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -556,6 +560,67 @@ impl ActiveChatTurn {
 }
 
 impl SessionManager {
+    fn current_config(&self) -> AppConfig {
+        self.config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    async fn replace_runtime(
+        &self,
+        new_runtime: Arc<CodexRuntime>,
+        new_config: AppConfig,
+    ) -> Result<()> {
+        let new_auth_refresh_task = spawn_proactive_auth_refresh_task(new_runtime.codex.clone());
+
+        {
+            let mut runtime = self.runtime.write().await;
+            *runtime = new_runtime;
+        }
+
+        {
+            let mut config = self
+                .config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *config = new_config;
+        }
+
+        if let Some(handle) = self
+            .auth_refresh_task
+            .lock()
+            .await
+            .replace(new_auth_refresh_task)
+        {
+            handle.abort();
+        }
+
+        let active_turns = {
+            let mut active_turns = self.active_turns.lock().await;
+            std::mem::take(&mut *active_turns)
+        };
+        for active in active_turns.into_values() {
+            active.mark_finished();
+        }
+
+        self.chats.lock().await.clear();
+        *self.orchestrator.lock().await = None;
+
+        Ok(())
+    }
+
+    async fn reload_config_and_restart_runtime(&self, new_config: AppConfig) -> Result<()> {
+        let _guard = self.reconnect_lock.lock().await;
+        info!(
+            working_directory = %new_config.codex.working_directory.display(),
+            "reloading SessionManager config and restarting Codex runtime"
+        );
+
+        let new_runtime = Arc::new(CodexRuntime::start(&new_config, self.approvals.clone()).await?);
+        self.replace_runtime(new_runtime, new_config).await
+    }
+
     pub async fn new(config: AppConfig, approvals: Arc<ApprovalManager>) -> Result<Self> {
         let runtime = Arc::new(CodexRuntime::start(&config, approvals.clone()).await?);
         let auth_refresh_task = spawn_proactive_auth_refresh_task(runtime.codex.clone());
@@ -564,7 +629,7 @@ impl SessionManager {
             runtime: tokio::sync::RwLock::new(runtime),
             approvals,
             sessions_path: config.sessions_path(),
-            config,
+            config: RwLock::new(config),
             state: Mutex::new(state),
             chats: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashMap::new()),
@@ -1017,11 +1082,12 @@ impl SessionManager {
     }
 
     fn base_thread_options(&self) -> ThreadOptions {
+        let config = self.current_config();
         let mut builder = ThreadOptions::builder()
-            .working_directory(self.config.codex.working_directory.display().to_string())
-            .skip_git_repo_check(self.config.codex.skip_git_repo_check)
-            .network_access_enabled(self.config.codex.network_access_enabled)
-            .web_search_enabled(self.config.codex.web_search_enabled)
+            .working_directory(config.codex.working_directory.display().to_string())
+            .skip_git_repo_check(config.codex.skip_git_repo_check)
+            .network_access_enabled(config.codex.network_access_enabled)
+            .web_search_enabled(config.codex.web_search_enabled)
             .web_search_mode(WebSearchMode::Live)
             .dynamic_tools(vec![
                 telegram_send_media_tool_spec(),
@@ -1029,18 +1095,18 @@ impl SessionManager {
             ])
             .additional_directories(self.additional_directories());
 
-        if let Some(model) = &self.config.codex.model {
+        if let Some(model) = &config.codex.model {
             builder = builder.model(model.clone());
         }
 
-        builder = match self.config.codex.approval_policy.as_str() {
+        builder = match config.codex.approval_policy.as_str() {
             "on-request" => builder.approval_policy(ApprovalMode::OnRequest),
             "on-failure" => builder.approval_policy(ApprovalMode::OnFailure),
             "untrusted" => builder.approval_policy(ApprovalMode::Untrusted),
             _ => builder.approval_policy(ApprovalMode::Never),
         };
 
-        builder = match self.config.codex.sandbox_mode.as_str() {
+        builder = match config.codex.sandbox_mode.as_str() {
             "read-only" => builder.sandbox_mode(SandboxMode::ReadOnly),
             "workspace-write" => builder.sandbox_mode(SandboxMode::WorkspaceWrite),
             _ => builder.sandbox_mode(SandboxMode::DangerFullAccess),
@@ -1050,10 +1116,11 @@ impl SessionManager {
     }
 
     fn additional_directories(&self) -> Vec<String> {
+        let config = self.current_config();
         let mut directories = Vec::new();
-        directories.push(self.config.attachment_root().display().to_string());
+        directories.push(config.attachment_root().display().to_string());
         directories.extend(
-            self.config
+            config
                 .codex
                 .additional_directories
                 .iter()
@@ -1067,10 +1134,11 @@ impl SessionManager {
         thread_id: &str,
         input: Input,
     ) -> requests::TurnStartParams {
+        let config = self.current_config();
         let mut extra = Map::new();
         extra.insert(
             "skipGitRepoCheck".to_string(),
-            Value::Bool(self.config.codex.skip_git_repo_check),
+            Value::Bool(config.codex.skip_git_repo_check),
         );
         extra.insert(
             "webSearchMode".to_string(),
@@ -1078,11 +1146,11 @@ impl SessionManager {
         );
         extra.insert(
             "webSearchEnabled".to_string(),
-            Value::Bool(self.config.codex.web_search_enabled),
+            Value::Bool(config.codex.web_search_enabled),
         );
         extra.insert(
             "networkAccessEnabled".to_string(),
-            Value::Bool(self.config.codex.network_access_enabled),
+            Value::Bool(config.codex.network_access_enabled),
         );
         extra.insert(
             "additionalDirectories".to_string(),
@@ -1097,15 +1165,15 @@ impl SessionManager {
         requests::TurnStartParams {
             thread_id: thread_id.to_string(),
             input: normalize_input_local(input),
-            cwd: Some(self.config.codex.working_directory.display().to_string()),
-            model: self.config.codex.model.clone(),
+            cwd: Some(config.codex.working_directory.display().to_string()),
+            model: config.codex.model.clone(),
             model_provider: None,
             effort: None,
             summary: None,
             personality: None,
             output_schema: None,
             approval_policy: Some(
-                normalized_approval_policy(&self.config.codex.approval_policy).to_string(),
+                normalized_approval_policy(&config.codex.approval_policy).to_string(),
             ),
             sandbox_policy: None,
             collaboration_mode: None,
@@ -1125,35 +1193,9 @@ impl SessionManager {
             "reinitializing Codex runtime after transport failure"
         );
 
-        let new_runtime =
-            Arc::new(CodexRuntime::start(&self.config, self.approvals.clone()).await?);
-        let new_auth_refresh_task = spawn_proactive_auth_refresh_task(new_runtime.codex.clone());
-
-        {
-            let mut runtime = self.runtime.write().await;
-            *runtime = new_runtime;
-        }
-
-        if let Some(handle) = self
-            .auth_refresh_task
-            .lock()
-            .await
-            .replace(new_auth_refresh_task)
-        {
-            handle.abort();
-        }
-
-        let active_turns = {
-            let mut active_turns = self.active_turns.lock().await;
-            std::mem::take(&mut *active_turns)
-        };
-        for active in active_turns.into_values() {
-            active.mark_finished();
-        }
-        self.chats.lock().await.clear();
-        *self.orchestrator.lock().await = None;
-
-        Ok(())
+        let config = self.current_config();
+        let new_runtime = Arc::new(CodexRuntime::start(&config, self.approvals.clone()).await?);
+        self.replace_runtime(new_runtime, config).await
     }
 }
 
@@ -1239,6 +1281,11 @@ impl ChatTurnRunner for SessionManager {
 
     async fn ready(&self) -> Result<()> {
         self.codex_ready().await
+    }
+
+    async fn reload_config(&self, config: AppConfig) -> Result<()> {
+        self.reload_config_and_restart_runtime(config).await?;
+        self.ensure_orchestrator().await
     }
 }
 

@@ -61,7 +61,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
     let app = app.with_state(state.clone());
 
     #[cfg(unix)]
-    spawn_reload_task(state.config.clone());
+    spawn_reload_task(state.config.clone(), state.sessions.clone());
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!("listening on http://{}", listen);
@@ -74,6 +74,17 @@ pub async fn run(config: AppConfig) -> Result<()> {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
+}
+
+async fn reload_once(
+    config: &Arc<RwLock<AppConfig>>,
+    sessions: &Arc<dyn ChatTurnRunner>,
+) -> Result<()> {
+    let config_path = { config.read().await.paths.config_path.clone() };
+    let new_config = crate::config::AppConfig::load(Some(config_path))?;
+    sessions.reload_config(new_config.clone()).await?;
+    *config.write().await = new_config;
+    Ok(())
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
@@ -398,7 +409,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(unix)]
-fn spawn_reload_task(config: Arc<RwLock<AppConfig>>) {
+fn spawn_reload_task(config: Arc<RwLock<AppConfig>>, sessions: Arc<dyn ChatTurnRunner>) {
     use tokio::signal::unix::{SignalKind, signal};
 
     tokio::spawn(async move {
@@ -409,11 +420,9 @@ fn spawn_reload_task(config: Arc<RwLock<AppConfig>>) {
             if hangup.recv().await.is_none() {
                 break;
             }
-            let config_path = { config.read().await.paths.config_path.clone() };
-            match crate::config::AppConfig::load(Some(config_path)) {
-                Ok(new_config) => {
-                    *config.write().await = new_config;
-                    info!("reloaded config after SIGHUP");
+            match reload_once(&config, &sessions).await {
+                Ok(()) => {
+                    info!("reloaded config and restarted Codex runtime after SIGHUP");
                 }
                 Err(error) => {
                     error!("failed to reload config after SIGHUP: {error}");
@@ -427,6 +436,7 @@ fn spawn_reload_task(config: Arc<RwLock<AppConfig>>) {
 mod tests {
     use super::*;
 
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -507,6 +517,38 @@ mod tests {
             self.requests.lock().await.push(request);
             self.attachments.lock().await.push(attachment);
             Ok(())
+        }
+    }
+
+    struct ReloadRecordingRunner {
+        result: Result<()>,
+        reloaded: Arc<std::sync::Mutex<Vec<AppConfig>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatTurnRunner for ReloadRecordingRunner {
+        async fn reset_chat(&self, _request: &ChatRequest) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run_chat_turn(
+            &self,
+            _request: ChatRequest,
+            _attachment: Option<DownloadedAttachment>,
+            _sink: &mut dyn OutputSink,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reload_config(&self, config: AppConfig) -> Result<()> {
+            self.reloaded
+                .lock()
+                .expect("reload recordings lock")
+                .push(config);
+            self.result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
         }
     }
 
@@ -1457,5 +1499,155 @@ mod tests {
             std::fs::set_permissions(&script_path, permissions)?;
         }
         Ok(script_path.display().to_string())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_once_updates_runner_and_shared_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("codexclaw.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[telegram]
+bot_token = "token"
+allowed_user_ids = [1]
+public_base_url = "https://example.com"
+webhook_secret = "secret"
+
+[voice]
+enabled = true
+transcriber_command = "parakeet-mlx"
+model = "mlx-community/parakeet-tdt-0.6b-v3"
+
+[codex]
+working_directory = "/tmp"
+model = "gpt-5.4-mini"
+"#,
+        )
+        .expect("write config");
+        let shared_config = Arc::new(RwLock::new(
+            AppConfig::load(Some(config_path.clone())).expect("load config"),
+        ));
+        let reloaded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sessions: Arc<dyn ChatTurnRunner> = Arc::new(ReloadRecordingRunner {
+            result: Ok(()),
+            reloaded: reloaded.clone(),
+        });
+
+        fs::write(
+            &config_path,
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[telegram]
+bot_token = "token"
+allowed_user_ids = [1]
+public_base_url = "https://example.com"
+webhook_secret = "changed"
+
+[voice]
+enabled = true
+transcriber_command = "parakeet-mlx"
+model = "mlx-community/parakeet-tdt-0.6b-v3"
+
+[codex]
+working_directory = "/tmp"
+model = "gpt-5.4"
+"#,
+        )
+        .expect("rewrite config");
+
+        reload_once(&shared_config, &sessions)
+            .await
+            .expect("reload succeeds");
+
+        let current = shared_config.read().await.clone();
+        assert_eq!(current.telegram.webhook_secret, "changed");
+        assert_eq!(current.codex.model.as_deref(), Some("gpt-5.4"));
+
+        let recorded = reloaded.lock().expect("recordings lock");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].telegram.webhook_secret, "changed");
+        assert_eq!(recorded[0].codex.model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_once_keeps_shared_config_when_runner_reload_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("codexclaw.toml");
+        fs::write(
+            &config_path,
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[telegram]
+bot_token = "token"
+allowed_user_ids = [1]
+public_base_url = "https://example.com"
+webhook_secret = "secret"
+
+[voice]
+enabled = true
+transcriber_command = "parakeet-mlx"
+model = "mlx-community/parakeet-tdt-0.6b-v3"
+
+[codex]
+working_directory = "/tmp"
+model = "gpt-5.4-mini"
+"#,
+        )
+        .expect("write config");
+        let shared_config = Arc::new(RwLock::new(
+            AppConfig::load(Some(config_path.clone())).expect("load config"),
+        ));
+        let reloaded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sessions: Arc<dyn ChatTurnRunner> = Arc::new(ReloadRecordingRunner {
+            result: Err(anyhow::anyhow!("boom")),
+            reloaded: reloaded.clone(),
+        });
+
+        fs::write(
+            &config_path,
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[telegram]
+bot_token = "token"
+allowed_user_ids = [1]
+public_base_url = "https://example.com"
+webhook_secret = "changed"
+
+[voice]
+enabled = true
+transcriber_command = "parakeet-mlx"
+model = "mlx-community/parakeet-tdt-0.6b-v3"
+
+[codex]
+working_directory = "/tmp"
+model = "gpt-5.4"
+"#,
+        )
+        .expect("rewrite config");
+
+        let error = reload_once(&shared_config, &sessions)
+            .await
+            .expect_err("reload fails");
+        assert!(error.to_string().contains("boom"));
+
+        let current = shared_config.read().await.clone();
+        assert_eq!(current.telegram.webhook_secret, "secret");
+        assert_eq!(current.codex.model.as_deref(), Some("gpt-5.4-mini"));
+
+        let recorded = reloaded.lock().expect("recordings lock");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].telegram.webhook_secret, "changed");
     }
 }

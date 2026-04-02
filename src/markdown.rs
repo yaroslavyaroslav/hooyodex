@@ -124,19 +124,25 @@ pub fn split_telegram_message(text: &str, limit: usize) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut open_tags: Vec<HtmlTag> = Vec::new();
 
     for line in text.lines() {
-        let next_len = current.chars().count() + line.chars().count() + 1;
+        let next_len =
+            current.chars().count() + line.chars().count() + usize::from(!current.is_empty());
         if !current.is_empty() && next_len > limit {
-            chunks.push(current.trim_end().to_string());
-            current.clear();
+            let finalized = finalize_html_chunk(&current, &open_tags);
+            chunks.push(finalized);
+            current = reopen_html_tags(&open_tags);
+        }
+        if !current.is_empty() {
+            current.push('\n');
         }
         current.push_str(line);
-        current.push('\n');
+        update_open_tags(line, &mut open_tags);
     }
 
-    if !current.trim().is_empty() {
-        chunks.push(current.trim_end().to_string());
+    if !current.is_empty() {
+        chunks.push(finalize_html_chunk(&current, &open_tags));
     }
 
     chunks
@@ -298,7 +304,106 @@ fn parse_link_target(target: &str) -> Option<String> {
 }
 
 fn escape_html_attribute(text: &str) -> String {
-    text.replace('"', "&quot;")
+    let mut output = String::new();
+    let mut i = 0usize;
+
+    while i < text.len() {
+        let remainder = &text[i..];
+        if remainder.starts_with("&amp;")
+            || remainder.starts_with("&lt;")
+            || remainder.starts_with("&gt;")
+            || remainder.starts_with("&quot;")
+        {
+            let end = remainder.find(';').expect("known entity terminator");
+            output.push_str(&remainder[..=end]);
+            i += end + 1;
+            continue;
+        }
+
+        let ch = remainder.chars().next().expect("remaining char");
+        match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            _ => output.push(ch),
+        }
+        i += ch.len_utf8();
+    }
+
+    output
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HtmlTag {
+    name: String,
+    opener: String,
+}
+
+fn finalize_html_chunk(current: &str, open_tags: &[HtmlTag]) -> String {
+    let mut chunk = current.trim_end().to_string();
+    for tag in open_tags.iter().rev() {
+        chunk.push_str("</");
+        chunk.push_str(&tag.name);
+        chunk.push('>');
+    }
+    chunk
+}
+
+fn reopen_html_tags(open_tags: &[HtmlTag]) -> String {
+    let mut chunk = String::new();
+    for tag in open_tags {
+        chunk.push_str(&tag.opener);
+    }
+    chunk
+}
+
+fn update_open_tags(line: &str, open_tags: &mut Vec<HtmlTag>) {
+    let mut i = 0usize;
+    let bytes = line.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let Some(end_rel) = line[i..].find('>') else {
+            break;
+        };
+        let end = i + end_rel;
+        let tag_text = &line[i..=end];
+        if let Some(name) = parse_closing_tag_name(tag_text) {
+            if let Some(position) = open_tags.iter().rposition(|tag| tag.name == name) {
+                open_tags.remove(position);
+            }
+        } else if let Some(name) = parse_opening_tag_name(tag_text) {
+            open_tags.push(HtmlTag {
+                name,
+                opener: tag_text.to_string(),
+            });
+        }
+        i = end + 1;
+    }
+}
+
+fn parse_opening_tag_name(tag_text: &str) -> Option<String> {
+    if !tag_text.starts_with('<') || tag_text.starts_with("</") || tag_text.ends_with("/>") {
+        return None;
+    }
+    let inner = &tag_text[1..tag_text.len() - 1];
+    let name = inner.split_whitespace().next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn parse_closing_tag_name(tag_text: &str) -> Option<&str> {
+    if !tag_text.starts_with("</") || !tag_text.ends_with('>') {
+        return None;
+    }
+    let inner = &tag_text[2..tag_text.len() - 1];
+    let name = inner.trim();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn fence_delimiter(line: &str) -> Option<&'static str> {
@@ -380,9 +485,47 @@ mod tests {
     }
 
     #[test]
+    fn escapes_special_html_characters_in_href_attributes() {
+        let rendered = markdown_to_telegram_html("[title](https://example.com?a=1&b=<tag>)");
+        assert_eq!(
+            rendered,
+            "<a href=\"https://example.com?a=1&amp;b=&lt;tag&gt;\">title</a>"
+        );
+    }
+
+    #[test]
     fn splits_large_messages() {
         let text = format!("{}\n{}", "a".repeat(3000), "b".repeat(3000));
         let chunks = split_telegram_message(&text, 4096);
         assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn splits_large_blockquote_messages_into_balanced_html_chunks() {
+        let markdown = format!(
+            "> {}\n> {}\n> {}",
+            "a".repeat(2500),
+            "b".repeat(2500),
+            "c".repeat(2500)
+        );
+        let html = markdown_to_telegram_html(&markdown);
+        let chunks = split_telegram_message(&html, 4096);
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            assert_eq!(
+                chunk.matches("<blockquote>").count(),
+                chunk.matches("</blockquote>").count()
+            );
+            assert_eq!(chunk.matches("<b>").count(), chunk.matches("</b>").count());
+            assert_eq!(chunk.matches("<i>").count(), chunk.matches("</i>").count());
+            assert_eq!(
+                chunk.matches("<code>").count(),
+                chunk.matches("</code>").count()
+            );
+            assert_eq!(
+                chunk.matches("<pre>").count(),
+                chunk.matches("</pre>").count()
+            );
+        }
     }
 }
