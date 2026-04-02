@@ -9,6 +9,7 @@ use crate::{ServiceCommand, config::AppPaths};
 
 const LINUX_SERVICE_NAME: &str = "codexclaw.service";
 const MAC_LABEL: &str = "dev.codexclaw.agent";
+const MAC_ALT_LABEL: &str = "com.codexclaw.agent";
 
 pub fn handle(command: ServiceCommand, paths: &AppPaths) -> Result<()> {
     match command {
@@ -127,7 +128,11 @@ fn run_platform_action(paths: &AppPaths, action: PlatformAction) -> Result<()> {
         }
         "macos" => {
             let domain = launchctl_domain();
-            let label = format!("{}/{}", domain, MAC_LABEL);
+            let active_label = match action {
+                PlatformAction::Start => MAC_LABEL.to_string(),
+                _ => detect_active_macos_label().unwrap_or_else(|| MAC_LABEL.to_string()),
+            };
+            let label = format!("{}/{}", domain, active_label);
             let mut command = Command::new("launchctl");
             match action {
                 PlatformAction::Start => {
@@ -220,6 +225,22 @@ fn mac_plist_path() -> Result<PathBuf> {
 fn launchctl_domain() -> String {
     let uid = nix_like_uid();
     format!("gui/{uid}")
+}
+
+fn detect_active_macos_label() -> Option<String> {
+    let domain = launchctl_domain();
+    for label in [MAC_LABEL, MAC_ALT_LABEL] {
+        let Ok(output) = Command::new("launchctl")
+            .args(["print", &format!("{domain}/{label}")])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            return Some(label.to_string());
+        }
+    }
+    None
 }
 
 fn nix_like_uid() -> String {

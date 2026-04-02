@@ -31,6 +31,10 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub telegram: TelegramConfig,
     #[serde(default)]
+    pub whatsapp: Option<WhatsAppConfig>,
+    #[serde(default)]
+    pub operator: OperatorConfig,
+    #[serde(default)]
     pub voice: VoiceConfig,
     pub codex: CodexConfig,
 }
@@ -48,6 +52,32 @@ pub struct TelegramConfig {
     pub webhook_secret: String,
     #[serde(default = "default_telegram_api_base")]
     pub api_base_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WhatsAppConfig {
+    #[serde(default = "default_whatsapp_account_id")]
+    pub account_id: String,
+    pub verify_token: String,
+    pub access_token: String,
+    pub phone_number_id: String,
+    #[serde(default = "default_whatsapp_webhook_path")]
+    pub webhook_path: String,
+    #[serde(default = "default_whatsapp_api_base")]
+    pub api_base_url: String,
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct OperatorConfig {
+    pub telegram: Option<OperatorTelegramConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OperatorTelegramConfig {
+    pub chat_id: i64,
+    pub thread_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -150,6 +180,20 @@ fn validate(config: &AppConfig) -> Result<()> {
     if !config.telegram.public_base_url.starts_with("https://") {
         bail!("telegram.public_base_url must start with https://");
     }
+    if let Some(whatsapp) = &config.whatsapp {
+        if whatsapp.verify_token.trim().is_empty() {
+            bail!("whatsapp.verify_token must not be empty");
+        }
+        if whatsapp.access_token.trim().is_empty() {
+            bail!("whatsapp.access_token must not be empty");
+        }
+        if whatsapp.phone_number_id.trim().is_empty() {
+            bail!("whatsapp.phone_number_id must not be empty");
+        }
+        if !whatsapp.webhook_path.starts_with('/') {
+            bail!("whatsapp.webhook_path must start with /");
+        }
+    }
     if !config.codex.working_directory.is_absolute() {
         bail!("codex.working_directory must be an absolute path");
     }
@@ -182,6 +226,18 @@ fn default_true() -> bool {
 
 fn default_telegram_api_base() -> String {
     "https://api.telegram.org".to_string()
+}
+
+fn default_whatsapp_account_id() -> String {
+    "default".to_string()
+}
+
+fn default_whatsapp_webhook_path() -> String {
+    "/whatsapp/webhook".to_string()
+}
+
+fn default_whatsapp_api_base() -> String {
+    "https://graph.facebook.com/v21.0".to_string()
 }
 
 fn default_codex_connect_url() -> String {

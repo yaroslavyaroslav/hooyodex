@@ -8,6 +8,19 @@ public_base_url = "https://example.com"
 webhook_secret = "replace-with-random-secret"
 api_base_url = "https://api.telegram.org"
 
+[operator.telegram]
+chat_id = 123456789
+thread_id = 42
+
+[whatsapp]
+account_id = "default"
+verify_token = "replace-me"
+access_token = "replace-me"
+phone_number_id = "replace-me"
+webhook_path = "/whatsapp/webhook"
+api_base_url = "https://graph.facebook.com/v21.0"
+allowed_senders = []
+
 [voice]
 enabled = true
 transcriber_command = "parakeet-mlx"

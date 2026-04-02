@@ -90,7 +90,9 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::config::{AppPaths, CodexConfig, ServerConfig, TelegramConfig, VoiceConfig};
+    use crate::config::{
+        AppPaths, CodexConfig, OperatorConfig, ServerConfig, TelegramConfig, VoiceConfig,
+    };
 
     fn test_config(tempdir: &TempDir) -> AppConfig {
         AppConfig {
@@ -109,6 +111,8 @@ mod tests {
                 webhook_secret: "secret".to_string(),
                 api_base_url: "https://api.telegram.org".to_string(),
             },
+            whatsapp: None,
+            operator: OperatorConfig::default(),
             voice: VoiceConfig {
                 enabled: true,
                 transcriber_command: "parakeet-mlx".to_string(),

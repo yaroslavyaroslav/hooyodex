@@ -1,4 +1,6 @@
 mod app;
+mod approval;
+mod channels;
 mod codex;
 mod config;
 mod markdown;
