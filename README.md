@@ -1,4 +1,4 @@
-# CodexClaw
+# Hooyodex
 
 User-level Telegram gateway for persistent Codex app-server threads.
 
@@ -18,8 +18,8 @@ User-level Telegram gateway for persistent Codex app-server threads.
 
 Copy [config.example.toml](config.example.toml) to your user config path:
 
-- macOS default: `~/Library/Application Support/codexclaw/config.toml`
-- Linux default: `~/.config/codexclaw/config.toml`
+- macOS default: `~/Library/Application Support/hooyodex/config.toml`
+- Linux default: `~/.config/hooyodex/config.toml`
 
 ## Commands
 
@@ -36,7 +36,7 @@ cargo run -- service status
 
 ## Voice Recognition On macOS
 
-CodexClaw uses the local `parakeet-mlx` CLI for Telegram voice messages. The default model is `mlx-community/parakeet-tdt-0.6b-v3`.
+Hooyodex uses the local `parakeet-mlx` CLI for Telegram voice messages. The default model is `mlx-community/parakeet-tdt-0.6b-v3`.
 
 Install the prerequisites:
 
@@ -53,11 +53,11 @@ Verify the binary is visible:
 
 If your `launchd` environment does not include `~/.local/bin` in `PATH`, either:
 
-- keep the default fallback behavior in CodexClaw, which already checks `~/.local/bin/parakeet-mlx`, or
+- keep the default fallback behavior in Hooyodex, which already checks `~/.local/bin/parakeet-mlx`, or
 - set `voice.transcriber_command` in your config to an absolute path such as `"/Users/<you>/.local/bin/parakeet-mlx"`.
 
 ## Service notes
 
-- Linux install target: `~/.config/systemd/user/codexclaw.service`
-- macOS install target: `~/Library/LaunchAgents/dev.codexclaw.agent.plist`
+- Linux install target: `~/.config/systemd/user/hooyodex.service`
+- macOS install target: `~/Library/LaunchAgents/dev.hooyodex.agent.plist`
 - Reload sends `SIGHUP`; the process reloads config from disk for future requests.

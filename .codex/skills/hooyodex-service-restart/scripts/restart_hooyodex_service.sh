@@ -3,10 +3,10 @@ set -euo pipefail
 
 SERVICE_PATH_DEFAULT="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin"
 LOG_DIR="$HOME/Library/Logs"
-CONFIG_PATH_DEFAULT="$HOME/Library/Application Support/codexclaw/config.toml"
-ALT_CONFIG_PATH="$HOME/.config/codexclaw/config.toml"
-DEV_LABEL="dev.codexclaw.agent"
-COM_LABEL="com.codexclaw.agent"
+CONFIG_PATH_DEFAULT="$HOME/Library/Application Support/hooyodex/config.toml"
+ALT_CONFIG_PATH="$HOME/.config/hooyodex/config.toml"
+DEV_LABEL="dev.hooyodex.agent"
+COM_LABEL="com.hooyodex.agent"
 DEV_PLIST="$HOME/Library/LaunchAgents/$DEV_LABEL.plist"
 COM_PLIST="$HOME/Library/LaunchAgents/$COM_LABEL.plist"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,9 +15,9 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  restart_codexclaw_service.sh status
-  restart_codexclaw_service.sh restart
-  restart_codexclaw_service.sh repair-plist <dev.codexclaw.agent|com.codexclaw.agent> [binary_path] [config_path]
+  restart_hooyodex_service.sh status
+  restart_hooyodex_service.sh restart
+  restart_hooyodex_service.sh repair-plist <dev.hooyodex.agent|com.hooyodex.agent> [binary_path] [config_path]
 
 This script is sanitized for reusable skill guidance:
 - uses $HOME-based defaults
@@ -45,14 +45,14 @@ choose_active_label() {
     return 0
   fi
 
-  if lsof -nP -iTCP:4201 -sTCP:LISTEN 2>/dev/null | rg -q 'codexclaw'; then
+  if lsof -nP -iTCP:4201 -sTCP:LISTEN 2>/dev/null | rg -q 'hooyodex'; then
     local pid
     pid="$(lsof -nP -iTCP:4201 -sTCP:LISTEN -t 2>/dev/null | head -n1)"
-    if ps -p "$pid" -o command= | rg -q 'target/release/codexclaw'; then
+    if ps -p "$pid" -o command= | rg -q 'target/release/hooyodex'; then
       printf '%s\n' "$COM_LABEL"
       return 0
     fi
-    if ps -p "$pid" -o command= | rg -q 'target/debug/codexclaw'; then
+    if ps -p "$pid" -o command= | rg -q 'target/debug/hooyodex'; then
       printf '%s\n' "$DEV_LABEL"
       return 0
     fi
@@ -63,20 +63,20 @@ choose_active_label() {
 
 choose_binary() {
   local label="$1"
-  if [[ "$label" == "$COM_LABEL" && -x "$PWD/target/release/codexclaw" ]]; then
-    printf '%s\n' "$PWD/target/release/codexclaw"
+  if [[ "$label" == "$COM_LABEL" && -x "$PWD/target/release/hooyodex" ]]; then
+    printf '%s\n' "$PWD/target/release/hooyodex"
     return 0
   fi
-  if [[ "$label" == "$DEV_LABEL" && -x "$PWD/target/debug/codexclaw" ]]; then
-    printf '%s\n' "$PWD/target/debug/codexclaw"
+  if [[ "$label" == "$DEV_LABEL" && -x "$PWD/target/debug/hooyodex" ]]; then
+    printf '%s\n' "$PWD/target/debug/hooyodex"
     return 0
   fi
-  if [[ -x "$PWD/target/release/codexclaw" ]]; then
-    printf '%s\n' "$PWD/target/release/codexclaw"
+  if [[ -x "$PWD/target/release/hooyodex" ]]; then
+    printf '%s\n' "$PWD/target/release/hooyodex"
     return 0
   fi
-  if [[ -x "$PWD/target/debug/codexclaw" ]]; then
-    printf '%s\n' "$PWD/target/debug/codexclaw"
+  if [[ -x "$PWD/target/debug/hooyodex" ]]; then
+    printf '%s\n' "$PWD/target/debug/hooyodex"
     return 0
   fi
   return 1
@@ -106,9 +106,9 @@ plist_path_for_label() {
 template_for_label() {
   local label="$1"
   if [[ "$label" == "$COM_LABEL" ]]; then
-    printf '%s\n' "$SKILL_DIR/assets/plists/com.codexclaw.agent.plist.template"
+    printf '%s\n' "$SKILL_DIR/assets/plists/com.hooyodex.agent.plist.template"
   else
-    printf '%s\n' "$SKILL_DIR/assets/plists/dev.codexclaw.agent.plist.template"
+    printf '%s\n' "$SKILL_DIR/assets/plists/dev.hooyodex.agent.plist.template"
   fi
 }
 
@@ -133,12 +133,12 @@ render_plist() {
   mkdir -p "$(dirname "$plist_path")" "$LOG_DIR"
 
   sed \
-    -e "s|__CODEXCLAW_BIN__|$(escape_sed "$bin_path")|g" \
-    -e "s|__CODEXCLAW_CONFIG__|$(escape_sed "$config_path")|g" \
+    -e "s|__HOOYODEX_BIN__|$(escape_sed "$bin_path")|g" \
+    -e "s|__HOOYODEX_CONFIG__|$(escape_sed "$config_path")|g" \
     -e "s|__WORKING_DIRECTORY__|$(escape_sed "$working_dir")|g" \
     -e "s|__SERVICE_PATH__|$(escape_sed "$SERVICE_PATH_DEFAULT")|g" \
-    -e "s|__STDOUT_PATH__|$(escape_sed "$LOG_DIR/codexclaw.out.log")|g" \
-    -e "s|__STDERR_PATH__|$(escape_sed "$LOG_DIR/codexclaw.err.log")|g" \
+    -e "s|__STDOUT_PATH__|$(escape_sed "$LOG_DIR/hooyodex.out.log")|g" \
+    -e "s|__STDERR_PATH__|$(escape_sed "$LOG_DIR/hooyodex.err.log")|g" \
     "$template" > "$plist_path"
 
   printf '%s\n' "$plist_path"

@@ -7,7 +7,7 @@ Use this file when a plain restart is not enough.
 Run:
 
 ```bash
-.codex/skills/codexclaw-service-restart/scripts/detect-active-service.sh
+.codex/skills/hooyodex-service-restart/scripts/detect-active-service.sh
 ```
 
 Capture:
@@ -42,8 +42,8 @@ Use full re-bootstrap when any are true:
 
 Compare the installed plist with:
 
-- [../assets/plists/dev.codexclaw.agent.plist](../assets/plists/dev.codexclaw.agent.plist)
-- [../assets/plists/com.codexclaw.agent.plist](../assets/plists/com.codexclaw.agent.plist)
+- [../assets/plists/dev.hooyodex.agent.plist](../assets/plists/dev.hooyodex.agent.plist)
+- [../assets/plists/com.hooyodex.agent.plist](../assets/plists/com.hooyodex.agent.plist)
 
 Minimal fields that commonly need repair:
 
@@ -57,7 +57,7 @@ Minimal fields that commonly need repair:
 Then re-bootstrap:
 
 ```bash
-.codex/skills/codexclaw-service-restart/scripts/restart-launchd-service.sh \
+.codex/skills/hooyodex-service-restart/scripts/restart-launchd-service.sh \
   <label> \
   <plist-path>
 ```
@@ -66,7 +66,7 @@ Then re-bootstrap:
 
 Compare the installed unit with:
 
-- [../assets/systemd/codexclaw.service](../assets/systemd/codexclaw.service)
+- [../assets/systemd/hooyodex.service](../assets/systemd/hooyodex.service)
 
 Minimal fields that commonly need repair:
 
@@ -79,8 +79,8 @@ Minimal fields that commonly need repair:
 Then reload and restart:
 
 ```bash
-.codex/skills/codexclaw-service-restart/scripts/restart-systemd-service.sh \
-  codexclaw.service
+.codex/skills/hooyodex-service-restart/scripts/restart-systemd-service.sh \
+  hooyodex.service
 ```
 
 ## 5. Verification Standard

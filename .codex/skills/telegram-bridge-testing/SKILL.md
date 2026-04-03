@@ -1,6 +1,6 @@
 ---
 name: telegram-bridge-testing
-description: Test CodexClaw's Telegram integration through mocked Telegram Bot API calls and targeted runtime checks. Use when changing webhook handling, attachment download, Telegram output delivery, or message formatting.
+description: Test Hooyodex's Telegram integration through mocked Telegram Bot API calls and targeted runtime checks. Use when changing webhook handling, attachment download, Telegram output delivery, or message formatting.
 ---
 
 # Telegram Bridge Testing

@@ -3,32 +3,34 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.codexclaw.agent</string>
-
+  <string>com.hooyodex.agent</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__BIN__</string>
+    <string>__HOOYODEX_BIN__</string>
     <string>--config</string>
-    <string>__CONFIG_DIR__/config.toml</string>
+    <string>__HOOYODEX_CONFIG__</string>
     <string>run</string>
   </array>
-
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
-
   <key>WorkingDirectory</key>
-  <string>__CONFIG_DIR__</string>
-
+  <string>__WORKING_DIRECTORY__</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>CODEXCLAW_CONFIG</key>
-    <string>__CONFIG_DIR__/config.toml</string>
+    <key>HOOYODEX_CONFIG</key>
+    <string>__HOOYODEX_CONFIG__</string>
+    <key>PATH</key>
+    <string>__SERVICE_PATH__</string>
     <key>RUST_LOG</key>
     <string>info</string>
   </dict>
+  <key>StandardOutPath</key>
+  <string>__STDOUT_PATH__</string>
+  <key>StandardErrorPath</key>
+  <string>__STDERR_PATH__</string>
 </dict>
 </plist>

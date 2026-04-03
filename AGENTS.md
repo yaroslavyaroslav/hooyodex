@@ -1,6 +1,6 @@
-# CodexClaw
+# Hooyodex
 
-CodexClaw is a small Rust service that connects Telegram webhooks to persistent Codex app-server threads.
+Hooyodex is a small Rust service that connects Telegram webhooks to persistent Codex app-server threads.
 
 ## Working Style
 

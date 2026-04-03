@@ -676,7 +676,7 @@ impl SessionManager {
             let mut thread = arc.lock().await;
             let _ = thread
                 .run(
-                    "You are the persistent top-level orchestrator for this CodexClaw service. Maintain long-lived orchestration context. Only create automations or cron-style tasks when explicitly requested.",
+                    "You are the persistent top-level orchestrator for this Hooyodex service. Maintain long-lived orchestration context. Only create automations or cron-style tasks when explicitly requested.",
                     TurnOptions::default(),
                 )
                 .await?;

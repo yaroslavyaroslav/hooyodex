@@ -1,4 +1,0 @@
-interface:
-  display_name: "CodexClaw Restart"
-  short_description: "Restart, recover, and verify CodexClaw service"
-  default_prompt: "Use $codexclaw-service-restart to detect the active CodexClaw service, restart it with proof via PID change, repair the local plist or unit if needed, and verify health checks."

@@ -11,7 +11,7 @@ print_launchd_state() {
 
 detect_launchd_label() {
   local label
-  for label in dev.codexclaw.agent com.codexclaw.agent; do
+  for label in dev.hooyodex.agent com.hooyodex.agent; do
     if launchctl print "$domain/$label" >/dev/null 2>&1; then
       printf '%s\n' "$label"
       return 0

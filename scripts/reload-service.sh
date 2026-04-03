@@ -6,11 +6,11 @@ UID_NUM="$(id -u)"
 
 case "$OS" in
   darwin)
-    launchctl kill HUP "gui/$UID_NUM/com.codexclaw.agent" || \
-      launchctl kickstart -k "gui/$UID_NUM/com.codexclaw.agent"
+    launchctl kill HUP "gui/$UID_NUM/com.hooyodex.agent" || \
+      launchctl kickstart -k "gui/$UID_NUM/com.hooyodex.agent"
     ;;
   linux)
-    systemctl --user reload-or-restart codexclaw.service
+    systemctl --user reload-or-restart hooyodex.service
     ;;
   *)
     echo "Unsupported operating system: $OS" >&2

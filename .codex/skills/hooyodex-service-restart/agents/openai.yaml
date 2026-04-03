@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hooyodex Restart"
+  short_description: "Restart, recover, and verify Hooyodex service"
+  default_prompt: "Use $hooyodex-service-restart to detect the active Hooyodex service, restart it with proof via PID change, repair the local plist or unit if needed, and verify health checks."

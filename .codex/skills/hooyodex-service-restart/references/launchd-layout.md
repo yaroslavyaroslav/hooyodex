@@ -1,4 +1,4 @@
-# CodexClaw Launchd Layout
+# Hooyodex Launchd Layout
 
 Use this file when the restart path is ambiguous, the active label differs from the old skill assumptions, or the launch agent plist needs repair.
 
@@ -6,30 +6,30 @@ Use this file when the restart path is ambiguous, the active label differs from 
 
 - Home directory: `$HOME`
 - Repository root: current repo root; do not hardcode a username into instructions
-- macOS config path: `$HOME/Library/Application Support/codexclaw/config.toml`
-- Alternate config path seen in older instructions: `$HOME/.config/codexclaw/config.toml`
+- macOS config path: `$HOME/Library/Application Support/hooyodex/config.toml`
+- Alternate config path seen in older instructions: `$HOME/.config/hooyodex/config.toml`
 - Log files:
-  - `$HOME/Library/Logs/codexclaw.out.log`
-  - `$HOME/Library/Logs/codexclaw.err.log`
+  - `$HOME/Library/Logs/hooyodex.out.log`
+  - `$HOME/Library/Logs/hooyodex.err.log`
 - LaunchAgents:
-  - `$HOME/Library/LaunchAgents/dev.codexclaw.agent.plist`
-  - `$HOME/Library/LaunchAgents/com.codexclaw.agent.plist`
+  - `$HOME/Library/LaunchAgents/dev.hooyodex.agent.plist`
+  - `$HOME/Library/LaunchAgents/com.hooyodex.agent.plist`
 
 ## Labels Seen In This Repo
 
-- `dev.codexclaw.agent`
-  - Usually tied to `target/debug/codexclaw`
+- `dev.hooyodex.agent`
+  - Usually tied to `target/debug/hooyodex`
   - Healthy plist includes:
     - `PATH`
     - `StandardOutPath`
     - `StandardErrorPath`
-- `com.codexclaw.agent`
-  - Usually tied to `target/release/codexclaw`
+- `com.hooyodex.agent`
+  - Usually tied to `target/release/hooyodex`
   - Healthy plist includes:
     - `PATH`
     - `StandardOutPath`
     - `StandardErrorPath`
-    - `CODEXCLAW_CONFIG`
+    - `HOOYODEX_CONFIG`
 
 Never assume `dev` is active if `launchctl` and `ps` prove `com` is serving port `4201`.
 

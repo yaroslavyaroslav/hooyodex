@@ -6,10 +6,10 @@ UID_NUM="$(id -u)"
 
 case "$OS" in
   darwin)
-    launchctl kickstart -k "gui/$UID_NUM/com.codexclaw.agent"
+    launchctl kickstart -k "gui/$UID_NUM/com.hooyodex.agent"
     ;;
   linux)
-    systemctl --user restart codexclaw.service
+    systemctl --user restart hooyodex.service
     ;;
   *)
     echo "Unsupported operating system: $OS" >&2

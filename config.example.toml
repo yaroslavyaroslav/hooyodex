@@ -42,4 +42,4 @@ sandbox_mode = "danger-full-access"
 skip_git_repo_check = true
 network_access_enabled = true
 web_search_enabled = true
-orchestrator_name = "codexclaw-orchestrator"
+orchestrator_name = "hooyodex-orchestrator"

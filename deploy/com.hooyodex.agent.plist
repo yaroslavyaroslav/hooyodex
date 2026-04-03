@@ -3,34 +3,40 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.codexclaw.agent</string>
+  <string>com.hooyodex.agent</string>
+
   <key>ProgramArguments</key>
   <array>
-    <string>__CODEXCLAW_BIN__</string>
+    <string>__BIN__</string>
     <string>--config</string>
-    <string>__CODEXCLAW_CONFIG__</string>
+    <string>__CONFIG_DIR__/config.toml</string>
     <string>run</string>
   </array>
+
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
+
   <key>WorkingDirectory</key>
-  <string>__WORKING_DIRECTORY__</string>
+  <string>__CONFIG_DIR__</string>
+
   <key>EnvironmentVariables</key>
   <dict>
-    <key>CODEXCLAW_CONFIG</key>
-    <string>__CODEXCLAW_CONFIG__</string>
-    <key>PATH</key>
-    <string>__SERVICE_PATH__</string>
+    <key>HOOYODEX_CONFIG</key>
+    <string>__CONFIG_DIR__/config.toml</string>
     <key>RUST_LOG</key>
-    <string>info</string>
+    <string>hooyodex=info</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
+
   <key>StandardOutPath</key>
-  <string>__STDOUT_PATH__</string>
+  <string>__LOG_DIR__/hooyodex.out.log</string>
+
   <key>StandardErrorPath</key>
-  <string>__STDERR_PATH__</string>
+  <string>__LOG_DIR__/hooyodex.err.log</string>
 </dict>
 </plist>

@@ -1436,12 +1436,12 @@ mod tests {
     }
 
     fn live_e2e_config(temp_root: &std::path::Path, api_base_url: &str) -> Result<AppConfig> {
-        let config_path = std::env::var("CODEXCLAW_E2E_CONFIG")
+        let config_path = std::env::var("HOOYODEX_E2E_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
                 dirs::config_dir()
                     .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join("codexclaw")
+                    .join("hooyodex")
                     .join("config.toml")
             });
 
@@ -1607,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn reload_once_updates_runner_and_shared_config() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("codexclaw.toml");
+        let config_path = temp.path().join("hooyodex.toml");
         fs::write(
             &config_path,
             r#"
@@ -1682,7 +1682,7 @@ model = "gpt-5.4"
     #[tokio::test]
     async fn reload_once_keeps_shared_config_when_runner_reload_fails() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("codexclaw.toml");
+        let config_path = temp.path().join("hooyodex.toml");
         fs::write(
             &config_path,
             r#"

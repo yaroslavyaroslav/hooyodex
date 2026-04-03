@@ -202,21 +202,21 @@ fn validate(config: &AppConfig) -> Result<()> {
 
 fn default_config_path() -> PathBuf {
     if let Some(dir) = dirs::config_dir() {
-        return dir.join("codexclaw").join("config.toml");
+        return dir.join("hooyodex").join("config.toml");
     }
-    Path::new(".").join("codexclaw.toml")
+    Path::new(".").join("hooyodex.toml")
 }
 
 fn default_state_dir() -> Result<PathBuf> {
     dirs::state_dir()
         .or_else(dirs::data_local_dir)
-        .map(|dir| dir.join("codexclaw"))
+        .map(|dir| dir.join("hooyodex"))
         .context("failed to determine state directory")
 }
 
 fn default_cache_dir() -> Result<PathBuf> {
     dirs::cache_dir()
-        .map(|dir| dir.join("codexclaw"))
+        .map(|dir| dir.join("hooyodex"))
         .context("failed to determine cache directory")
 }
 

@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.codexclaw.agent</string>
+  <string>com.hooyodex.agent</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$HOME/path/to/codexclaw</string>
+    <string>$HOME/path/to/hooyodex</string>
     <string>--config</string>
-    <string>$HOME/Library/Application Support/codexclaw/config.toml</string>
+    <string>$HOME/Library/Application Support/hooyodex/config.toml</string>
     <string>run</string>
   </array>
   <key>RunAtLoad</key>
@@ -18,19 +18,19 @@
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
   <key>WorkingDirectory</key>
-  <string>$HOME/Library/Application Support/codexclaw</string>
+  <string>$HOME/Library/Application Support/hooyodex</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>CODEXCLAW_CONFIG</key>
-    <string>$HOME/Library/Application Support/codexclaw/config.toml</string>
+    <key>HOOYODEX_CONFIG</key>
+    <string>$HOME/Library/Application Support/hooyodex/config.toml</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin</string>
     <key>RUST_LOG</key>
     <string>info</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>$HOME/Library/Logs/codexclaw.out.log</string>
+  <string>$HOME/Library/Logs/hooyodex.out.log</string>
   <key>StandardErrorPath</key>
-  <string>$HOME/Library/Logs/codexclaw.err.log</string>
+  <string>$HOME/Library/Logs/hooyodex.err.log</string>
 </dict>
 </plist>

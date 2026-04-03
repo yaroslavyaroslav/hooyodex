@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>dev.codexclaw.agent</string>
+  <string>dev.hooyodex.agent</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__CODEXCLAW_BIN__</string>
+    <string>__HOOYODEX_BIN__</string>
     <string>--config</string>
-    <string>__CODEXCLAW_CONFIG__</string>
+    <string>__HOOYODEX_CONFIG__</string>
     <string>run</string>
   </array>
   <key>RunAtLoad</key>
@@ -20,7 +20,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>RUST_LOG</key>
-    <string>codexclaw=info</string>
+    <string>hooyodex=info</string>
     <key>PATH</key>
     <string>__SERVICE_PATH__</string>
   </dict>

@@ -1,4 +1,4 @@
-When working in Telegram-facing CodexClaw sessions, prefer delivering the real local file with `telegram_send_media` whenever the user expects to receive, inspect, open, watch, or listen to the artifact itself.
+When working in Telegram-facing Hooyodex sessions, prefer delivering the real local file with `telegram_send_media` whenever the user expects to receive, inspect, open, watch, or listen to the artifact itself.
 
 Use `telegram_send_media` by default for all user-visible local artifacts, including:
 - screenshots, photos, generated images, and other image outputs;
