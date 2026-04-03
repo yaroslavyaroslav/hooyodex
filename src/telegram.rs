@@ -284,6 +284,32 @@ pub async fn send_markdown_message(
     Ok(())
 }
 
+pub async fn send_chat_action(
+    config: &AppConfig,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    action: &str,
+) -> Result<()> {
+    let client = Client::new();
+    let url = format!(
+        "{}/bot{}/sendChatAction",
+        config.telegram.api_base_url.trim_end_matches('/'),
+        config.telegram.bot_token
+    );
+    let mut body = json!({
+        "chat_id": chat_id,
+        "action": action,
+    });
+    if let Some(thread_id) = thread_id {
+        body["message_thread_id"] = json!(thread_id);
+    }
+    let response: serde_json::Value = client.post(&url).json(&body).send().await?.json().await?;
+    if response["ok"].as_bool() != Some(true) {
+        bail!("Telegram sendChatAction failed: {}", response);
+    }
+    Ok(())
+}
+
 pub async fn send_markdown_message_with_inline_keyboard(
     config: &AppConfig,
     chat_id: i64,

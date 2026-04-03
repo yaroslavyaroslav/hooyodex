@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::extract::{Path as AxumPath, Query, State};
@@ -9,7 +10,7 @@ use axum::{Json, Router, response::IntoResponse};
 use serde_json::json;
 use tokio::signal;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::approval::ApprovalManager;
 use crate::channels::whatsapp::{
@@ -246,6 +247,7 @@ async fn process_telegram_update(
     let chat_id = inbound.chat_id;
     let thread_id = inbound.thread_id;
     let message_id = inbound.message_id;
+    let typing_task = TelegramTypingTask::spawn(config.clone(), chat_id, thread_id);
     let request = ChatRequest::from_telegram(
         inbound.clone(),
         operator_target_for_telegram_inbound(config, &inbound),
@@ -255,7 +257,7 @@ async fn process_telegram_update(
         ReplyTarget::telegram(inbound.chat_id, inbound.thread_id),
     );
 
-    match runner.run_chat_turn(request, attachment, &mut sink).await {
+    let result = match runner.run_chat_turn(request, attachment, &mut sink).await {
         Ok(()) => Ok(()),
         Err(error) => {
             error!(chat_id, message_id, "Codex turn failed: {error}");
@@ -270,7 +272,10 @@ async fn process_telegram_update(
             .await;
             Ok(())
         }
-    }
+    };
+
+    typing_task.stop().await;
+    result
 }
 
 fn operator_target_for_telegram_inbound(
@@ -382,6 +387,42 @@ impl RoutedSink {
 impl OutputSink for RoutedSink {
     async fn send(&mut self, output: TurnOutput) -> Result<()> {
         send_turn_output_to_target(&self.config, &self.target, output).await
+    }
+}
+
+struct TelegramTypingTask {
+    stop: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TelegramTypingTask {
+    fn spawn(config: AppConfig, chat_id: i64, thread_id: Option<i64>) -> Self {
+        let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            loop {
+                if let Err(error) =
+                    crate::telegram::send_chat_action(&config, chat_id, thread_id, "typing").await
+                {
+                    warn!(chat_id, "failed to send Telegram typing status: {error}");
+                }
+
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                }
+            }
+        });
+
+        Self { stop, handle }
+    }
+
+    async fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = self.handle.await;
     }
 }
 
@@ -502,6 +543,27 @@ mod tests {
     struct CapturingRunner {
         requests: Arc<Mutex<Vec<ChatRequest>>>,
         attachments: Arc<Mutex<Vec<Option<DownloadedAttachment>>>>,
+    }
+
+    struct DelayedRunner {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatTurnRunner for DelayedRunner {
+        async fn reset_chat(&self, _request: &ChatRequest) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run_chat_turn(
+            &self,
+            _request: ChatRequest,
+            _attachment: Option<DownloadedAttachment>,
+            _sink: &mut dyn OutputSink,
+        ) -> Result<()> {
+            tokio::time::sleep(self.delay).await;
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -891,6 +953,32 @@ mod tests {
         assert_eq!(send_message["message_thread_id"].as_i64(), Some(777));
         assert_eq!(send_message["text"].as_str(), Some("Threaded reply"));
         assert_eq!(send_message["disable_notification"].as_bool(), Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_sends_typing_to_same_telegram_thread_while_running() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let update = sample_group_thread_update_with_text("hello", 777);
+        let inbound = normalize_update(&update, &[42]).expect("inbound");
+        let runner = DelayedRunner {
+            delay: Duration::from_millis(50),
+        };
+
+        process_telegram_update(&runner, &config, update, inbound).await?;
+
+        let requests = mock.requests().await;
+        let chat_action: Value = requests
+            .iter()
+            .find(|request| request.path.ends_with("/sendChatAction"))
+            .map(|request| serde_json::from_slice(&request.body).expect("sendChatAction json"))
+            .expect("sendChatAction request");
+
+        assert_eq!(chat_action["chat_id"].as_i64(), Some(100));
+        assert_eq!(chat_action["message_thread_id"].as_i64(), Some(777));
+        assert_eq!(chat_action["action"].as_str(), Some("typing"));
         Ok(())
     }
 
