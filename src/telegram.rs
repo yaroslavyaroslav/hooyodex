@@ -15,6 +15,8 @@ pub struct TelegramUpdate {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
     pub edited_message: Option<TelegramMessage>,
+    pub business_message: Option<TelegramMessage>,
+    pub edited_business_message: Option<TelegramMessage>,
     pub callback_query: Option<TelegramCallbackQuery>,
 }
 
@@ -24,6 +26,7 @@ pub struct TelegramMessage {
     pub chat: TelegramChat,
     pub from: Option<TelegramUser>,
     pub sender_chat: Option<TelegramSenderChat>,
+    pub business_connection_id: Option<String>,
     pub text: Option<String>,
     pub caption: Option<String>,
     pub photo: Option<Vec<TelegramPhotoSize>>,
@@ -83,6 +86,29 @@ pub struct TelegramTextQuote {
     pub text: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramBusinessConnection {
+    pub rights: Option<TelegramBusinessBotRights>,
+    #[serde(default)]
+    pub is_enabled: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramBusinessBotRights {
+    pub can_read_messages: Option<bool>,
+}
+
+impl TelegramBusinessConnection {
+    pub fn can_read_messages(&self) -> bool {
+        self.is_enabled
+            && self
+                .rights
+                .as_ref()
+                .and_then(|rights| rights.can_read_messages)
+                .unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
     pub chat_id: i64,
@@ -135,8 +161,18 @@ impl InboundMessage {
     }
 }
 
+impl TelegramUpdate {
+    pub fn any_message(&self) -> Option<&TelegramMessage> {
+        self.message
+            .as_ref()
+            .or(self.edited_message.as_ref())
+            .or(self.business_message.as_ref())
+            .or(self.edited_business_message.as_ref())
+    }
+}
+
 pub fn normalize_update(update: &TelegramUpdate, allowed_users: &[i64]) -> Option<InboundMessage> {
-    let message = update.message.as_ref().or(update.edited_message.as_ref())?;
+    let message = update.any_message()?;
 
     let (sender_id, sender_name) = if let Some(from) = &message.from {
         let first = from
@@ -222,6 +258,14 @@ pub async fn set_webhook(config: &AppConfig) -> Result<()> {
     let body = json!({
         "url": config.webhook_url(),
         "drop_pending_updates": false,
+        "allowed_updates": [
+            "message",
+            "edited_message",
+            "callback_query",
+            "business_connection",
+            "business_message",
+            "edited_business_message"
+        ],
     });
     let response: serde_json::Value = client.post(url).json(&body).send().await?.json().await?;
     if response["ok"].as_bool() != Some(true) {
@@ -308,6 +352,78 @@ pub async fn send_chat_action(
         bail!("Telegram sendChatAction failed: {}", response);
     }
     Ok(())
+}
+
+pub async fn get_business_connection(
+    config: &AppConfig,
+    business_connection_id: &str,
+) -> Result<TelegramBusinessConnection> {
+    let client = Client::new();
+    let url = format!(
+        "{}/bot{}/getBusinessConnection",
+        config.telegram.api_base_url.trim_end_matches('/'),
+        config.telegram.bot_token
+    );
+    let body = json!({
+        "business_connection_id": business_connection_id,
+    });
+    let response: serde_json::Value = client.post(&url).json(&body).send().await?.json().await?;
+    if response["ok"].as_bool() != Some(true) {
+        bail!("Telegram getBusinessConnection failed: {}", response);
+    }
+    serde_json::from_value(response["result"].clone())
+        .context("Telegram getBusinessConnection returned invalid result")
+}
+
+pub async fn read_business_message(
+    config: &AppConfig,
+    business_connection_id: &str,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<()> {
+    let client = Client::new();
+    let url = format!(
+        "{}/bot{}/readBusinessMessage",
+        config.telegram.api_base_url.trim_end_matches('/'),
+        config.telegram.bot_token
+    );
+    let body = json!({
+        "business_connection_id": business_connection_id,
+        "chat_id": chat_id,
+        "message_id": message_id,
+    });
+    let response: serde_json::Value = client.post(&url).json(&body).send().await?.json().await?;
+    if response["ok"].as_bool() != Some(true) {
+        bail!("Telegram readBusinessMessage failed: {}", response);
+    }
+    Ok(())
+}
+
+pub async fn maybe_mark_business_message_read(
+    config: &AppConfig,
+    message: &TelegramMessage,
+) -> Result<bool> {
+    let Some(business_connection_id) = message
+        .business_connection_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+
+    let connection = get_business_connection(config, business_connection_id).await?;
+    if !connection.can_read_messages() {
+        return Ok(false);
+    }
+
+    read_business_message(
+        config,
+        business_connection_id,
+        message.chat.id,
+        message.message_id,
+    )
+    .await?;
+    Ok(true)
 }
 
 pub async fn send_markdown_message_with_inline_keyboard(
@@ -606,6 +722,7 @@ mod tests {
                 last_name: None,
             }),
             sender_chat: None,
+            business_connection_id: None,
             text: Some("hello".to_string()),
             caption: None,
             photo: None,
@@ -623,6 +740,8 @@ mod tests {
             update_id: 1,
             message: Some(sample_message()),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: None,
         };
         assert!(normalize_update(&update, &[999]).is_none());
@@ -640,6 +759,8 @@ mod tests {
             update_id: 1,
             message: Some(message),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: None,
         };
         let inbound = normalize_update(&update, &[42]).expect("inbound");
@@ -667,6 +788,8 @@ mod tests {
                 update_id: 1,
                 message: Some(sample_message()),
                 edited_message: None,
+                business_message: None,
+                edited_business_message: None,
                 callback_query: None,
             },
             &[42],
@@ -681,6 +804,8 @@ mod tests {
                 update_id: 2,
                 message: Some(command_message),
                 edited_message: None,
+                business_message: None,
+                edited_business_message: None,
                 callback_query: None,
             },
             &[42],
@@ -695,6 +820,8 @@ mod tests {
                 update_id: 3,
                 message: Some(russian_command_message),
                 edited_message: None,
+                business_message: None,
+                edited_business_message: None,
                 callback_query: None,
             },
             &[42],
@@ -711,6 +838,8 @@ mod tests {
             update_id: 1,
             message: Some(message),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: None,
         };
 
@@ -731,6 +860,8 @@ mod tests {
             update_id: 4,
             message: Some(message),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: None,
         };
 
@@ -750,6 +881,8 @@ mod tests {
             update_id: 5,
             message: Some(message),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: None,
         };
 

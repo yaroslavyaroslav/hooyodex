@@ -165,6 +165,15 @@ async fn telegram_webhook(
         return StatusCode::OK;
     };
 
+    info!(
+        update_id = update.update_id,
+        chat_id = inbound.chat_id,
+        sender_id = inbound.sender_id,
+        message_id = inbound.message_id,
+        thread_id = inbound.thread_id,
+        "accepted Telegram update"
+    );
+
     let sessions = state.sessions.clone();
     tokio::spawn(async move {
         if let Err(error) =
@@ -177,12 +186,40 @@ async fn telegram_webhook(
     StatusCode::OK
 }
 
+async fn mark_telegram_message_read_if_permitted(
+    config: &AppConfig,
+    update: &TelegramUpdate,
+) -> Result<bool> {
+    let Some(message) = update.any_message() else {
+        return Ok(false);
+    };
+    crate::telegram::maybe_mark_business_message_read(config, message).await
+}
+
 async fn process_telegram_update(
     runner: &dyn ChatTurnRunner,
     config: &AppConfig,
     update: TelegramUpdate,
     inbound: crate::telegram::InboundMessage,
 ) -> Result<()> {
+    match mark_telegram_message_read_if_permitted(config, &update).await {
+        Ok(true) => {
+            info!(
+                chat_id = inbound.chat_id,
+                message_id = inbound.message_id,
+                "marked Telegram business message as read"
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(
+                chat_id = inbound.chat_id,
+                message_id = inbound.message_id,
+                "failed to mark Telegram business message as read: {error}"
+            );
+        }
+    }
+
     if inbound.requests_new_chat() {
         let request = ChatRequest::from_telegram(
             inbound.clone(),
@@ -247,7 +284,8 @@ async fn process_telegram_update(
     let chat_id = inbound.chat_id;
     let thread_id = inbound.thread_id;
     let message_id = inbound.message_id;
-    let typing_task = TelegramTypingTask::spawn(config.clone(), chat_id, thread_id);
+    info!(chat_id, message_id, thread_id, "starting Telegram turn");
+    let typing_task = TelegramTypingTask::spawn(config.clone(), chat_id);
     let request = ChatRequest::from_telegram(
         inbound.clone(),
         operator_target_for_telegram_inbound(config, &inbound),
@@ -396,14 +434,18 @@ struct TelegramTypingTask {
 }
 
 impl TelegramTypingTask {
-    fn spawn(config: AppConfig, chat_id: i64, thread_id: Option<i64>) -> Self {
+    fn spawn(config: AppConfig, chat_id: i64) -> Self {
         let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move {
+            let mut logged_success = false;
             loop {
                 if let Err(error) =
-                    crate::telegram::send_chat_action(&config, chat_id, thread_id, "typing").await
+                    crate::telegram::send_chat_action(&config, chat_id, None, "typing").await
                 {
                     warn!(chat_id, "failed to send Telegram typing status: {error}");
+                } else if !logged_success {
+                    info!(chat_id, "sent Telegram typing status");
+                    logged_success = true;
                 }
 
                 tokio::select! {
@@ -514,6 +556,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockTelegramState {
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        business_connection_result: Arc<Mutex<Value>>,
     }
 
     struct FakeTurnRunner {
@@ -722,6 +765,8 @@ mod tests {
                     update_id: 999,
                     message: None,
                     edited_message: None,
+                    business_message: None,
+                    edited_business_message: None,
                     callback_query: Some(TelegramCallbackQuery {
                         id: "cb-1".to_string(),
                         from: TelegramUser {
@@ -738,6 +783,7 @@ mod tests {
                                 last_name: None,
                             }),
                             sender_chat: None,
+                            business_connection_id: None,
                             text: Some("approval".to_string()),
                             caption: None,
                             photo: None,
@@ -816,6 +862,8 @@ mod tests {
                         update_id: 1000,
                         message: None,
                         edited_message: None,
+                        business_message: None,
+                        edited_business_message: None,
                         callback_query: Some(TelegramCallbackQuery {
                             id: "cb-2".to_string(),
                             from: TelegramUser {
@@ -832,6 +880,7 @@ mod tests {
                                     last_name: None,
                                 }),
                                 sender_chat: None,
+                                business_connection_id: None,
                                 text: Some("approval".to_string()),
                                 caption: None,
                                 photo: None,
@@ -864,6 +913,7 @@ mod tests {
                                 last_name: None,
                             }),
                             sender_chat: None,
+                            business_connection_id: None,
                             text: Some("Make it shorter".to_string()),
                             caption: None,
                             photo: None,
@@ -874,6 +924,8 @@ mod tests {
                             quote: None,
                         }),
                         edited_message: None,
+                        business_message: None,
+                        edited_business_message: None,
                         callback_query: None,
                     },
                     &[42],
@@ -977,8 +1029,75 @@ mod tests {
             .expect("sendChatAction request");
 
         assert_eq!(chat_action["chat_id"].as_i64(), Some(100));
-        assert_eq!(chat_action["message_thread_id"].as_i64(), Some(777));
+        assert!(chat_action.get("message_thread_id").is_none());
         assert_eq!(chat_action["action"].as_str(), Some("typing"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_marks_business_message_as_read_when_permitted() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        mock.set_business_connection_result(json!({
+            "id": "bc-1",
+            "is_enabled": true,
+            "rights": {
+                "can_read_messages": true
+            }
+        }))
+        .await;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let update = sample_business_update_with_text("hello", "bc-1");
+        assert!(mark_telegram_message_read_if_permitted(&config, &update).await?);
+
+        let requests = mock.requests().await;
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|request| request.path.clone())
+            .collect();
+        let read_call: Value = requests
+            .iter()
+            .find(|request| request.path.ends_with("/readBusinessMessage"))
+            .map(|request| serde_json::from_slice(&request.body).expect("readBusinessMessage json"))
+            .unwrap_or_else(|| panic!("readBusinessMessage request not found in {:?}", paths));
+
+        assert_eq!(read_call["business_connection_id"].as_str(), Some("bc-1"));
+        assert_eq!(read_call["chat_id"].as_i64(), Some(100));
+        assert_eq!(read_call["message_id"].as_i64(), Some(44));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_skips_business_read_receipt_without_rights() -> Result<()> {
+        let mock = start_mock_telegram_api().await?;
+        mock.set_business_connection_result(json!({
+            "id": "bc-1",
+            "is_enabled": true,
+            "rights": {}
+        }))
+        .await;
+        let tempdir = TempDir::new()?;
+        let config = test_config(tempdir.path(), &mock.base_url);
+        let update = sample_business_update_with_text("hello", "bc-1");
+        assert!(!mark_telegram_message_read_if_permitted(&config, &update).await?);
+
+        let requests = mock.requests().await;
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|request| request.path.clone())
+            .collect();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path.ends_with("/getBusinessConnection")),
+            "expected getBusinessConnection in {:?}",
+            paths
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path.ends_with("/readBusinessMessage"))
+        );
         Ok(())
     }
 
@@ -1418,6 +1537,7 @@ mod tests {
                     last_name: None,
                 }),
                 sender_chat: None,
+                business_connection_id: None,
                 text: None,
                 caption: None,
                 photo: None,
@@ -1431,6 +1551,8 @@ mod tests {
                 quote: None,
             }),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: None,
         }
     }
@@ -1478,6 +1600,7 @@ mod tests {
                     last_name: None,
                 }),
                 sender_chat: None,
+                business_connection_id: None,
                 text: Some(text.to_string()),
                 caption: None,
                 photo: None,
@@ -1488,6 +1611,8 @@ mod tests {
                 quote: None,
             }),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: None,
         }
     }
@@ -1504,6 +1629,7 @@ mod tests {
                     last_name: None,
                 }),
                 sender_chat: None,
+                business_connection_id: None,
                 text: Some(text.to_string()),
                 caption: None,
                 photo: None,
@@ -1514,6 +1640,40 @@ mod tests {
                 quote: None,
             }),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
+            callback_query: None,
+        }
+    }
+
+    fn sample_business_update_with_text(
+        text: &str,
+        business_connection_id: &str,
+    ) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id: 4,
+            message: None,
+            edited_message: None,
+            business_message: Some(TelegramMessage {
+                message_id: 44,
+                chat: TelegramChat { id: 100 },
+                from: Some(TelegramUser {
+                    id: 42,
+                    first_name: Some("Test".to_string()),
+                    last_name: None,
+                }),
+                sender_chat: None,
+                business_connection_id: Some(business_connection_id.to_string()),
+                text: Some(text.to_string()),
+                caption: None,
+                photo: None,
+                document: None,
+                voice: None,
+                message_thread_id: Some(777),
+                reply_to_message: None,
+                quote: None,
+            }),
+            edited_business_message: None,
             callback_query: None,
         }
     }
@@ -1543,6 +1703,10 @@ mod tests {
         async fn requests(&self) -> Vec<RecordedRequest> {
             self.state.requests.lock().await.clone()
         }
+
+        async fn set_business_connection_result(&self, result: Value) {
+            *self.state.business_connection_result.lock().await = result;
+        }
     }
 
     async fn start_mock_telegram_api() -> Result<MockTelegramApi> {
@@ -1557,6 +1721,11 @@ mod tests {
             });
             if uri.path().ends_with("/getFile") {
                 Json(json!({ "ok": true, "result": { "file_path": "voice/file.ogg" } }))
+            } else if uri.path().ends_with("/getBusinessConnection") {
+                Json(json!({
+                    "ok": true,
+                    "result": state.business_connection_result.lock().await.clone(),
+                }))
             } else if uri.path().ends_with("/sendMessage") {
                 Json(json!({ "ok": true, "result": { "message_id": 500 } }))
             } else {

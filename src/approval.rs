@@ -230,7 +230,7 @@ impl ApprovalManager {
         update: &TelegramUpdate,
         allowed_users: &[i64],
     ) -> Result<bool> {
-        let Some(message) = update.message.as_ref().or(update.edited_message.as_ref()) else {
+        let Some(message) = update.any_message() else {
             return Ok(false);
         };
         let Some(from) = message.from.as_ref() else {
@@ -387,6 +387,8 @@ mod tests {
             update_id: 1,
             message: None,
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: Some(TelegramCallbackQuery {
                 id: "cb-1".to_string(),
                 from: TelegramUser {
@@ -403,6 +405,7 @@ mod tests {
                         last_name: None,
                     }),
                     sender_chat: None,
+                    business_connection_id: None,
                     text: Some("approval".to_string()),
                     caption: None,
                     photo: None,
@@ -429,6 +432,7 @@ mod tests {
                     last_name: None,
                 }),
                 sender_chat: None,
+                business_connection_id: None,
                 text: Some(text.to_string()),
                 caption: None,
                 photo: None,
@@ -439,6 +443,8 @@ mod tests {
                 quote: None,
             }),
             edited_message: None,
+            business_message: None,
+            edited_business_message: None,
             callback_query: None,
         }
     }
