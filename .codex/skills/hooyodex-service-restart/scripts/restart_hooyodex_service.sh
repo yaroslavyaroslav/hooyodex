@@ -11,17 +11,20 @@ DEV_PLIST="$HOME/Library/LaunchAgents/$DEV_LABEL.plist"
 COM_PLIST="$HOME/Library/LaunchAgents/$COM_LABEL.plist"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/restart-lock.sh"
 
 usage() {
   cat <<'EOF'
 Usage:
   restart_hooyodex_service.sh status
   restart_hooyodex_service.sh restart
+  restart_hooyodex_service.sh clear-lock
   restart_hooyodex_service.sh repair-plist <dev.hooyodex.agent|com.hooyodex.agent> [binary_path] [config_path]
 
 This script is sanitized for reusable skill guidance:
 - uses $HOME-based defaults
 - prints active label, PID, and health
+- writes a project-local restart lock with the pre-restart PID and uses it to avoid duplicate restarts after state loss
 - can rewrite a missing/broken plist from bundled templates
 EOF
 }
@@ -160,6 +163,14 @@ restart_label() {
   local label="$1"
   local old_pid new_pid
   old_pid="$(current_pid_for_label "$label" || true)"
+  if restart_lock::clear_existing_if_restarted "${old_pid:-}"; then
+    if [[ -n "$old_pid" ]]; then
+      ps -p "$old_pid" -o pid,lstart,etime,command
+    fi
+    print_health
+    return 0
+  fi
+  restart_lock::create "${old_pid:-}"
   if [[ -n "$old_pid" ]]; then
     ps -p "$old_pid" -o pid,lstart,etime,command
   fi
@@ -199,6 +210,7 @@ case "$cmd" in
   status)
     label="$(choose_active_label)"
     echo "label=$label"
+    restart_lock::status_note
     launchctl_summary "$label"
     pid="$(current_pid_for_label "$label" || true)"
     if [[ -n "${pid:-}" ]]; then
@@ -210,6 +222,9 @@ case "$cmd" in
     label="$(choose_active_label)"
     echo "label=$label"
     restart_label "$label"
+    ;;
+  clear-lock)
+    restart_lock::clear
     ;;
   repair-plist)
     if [[ $# -lt 2 ]]; then

@@ -32,6 +32,8 @@ Use this skill for this repository's local Hooyodex daemon only.
 - Treat the service manager as the source of truth for the active job label, but confirm with the actual listening process on the health port.
 - Do not assume `dev.hooyodex.agent` is active. Check `com.hooyodex.agent` too, then fall back to the port listener and its command line.
 - Do not call a restart complete unless the old process exited and a new PID replaced it.
+- Before any restart command, check the project root for `.hooyodex-service-restart.lock`. The primary scripts now write the pre-restart PID into that file immediately before restarting.
+- If a later command finds an existing lock, compare the PID in the lock with the current service PID. If they differ, treat that as evidence the restart already happened, clear the lock, and verify PID/health instead of firing a second restart. If they do not differ, clear the stale lock and proceed with one fresh restart attempt.
 - If `kickstart` succeeds but the service stops listening or lands in `spawn scheduled`, escalate to the recovery flow: inspect logs, inspect the plist, repair the template if needed, then `bootout/bootstrap/kickstart`.
 - Keep templates sanitized. Use `$HOME`, `%h`, and `$(id -u)` in instructions and resource files; never hardcode a real username or home directory.
 
@@ -50,9 +52,11 @@ Use this skill for this repository's local Hooyodex daemon only.
 3. Restart using the appropriate script:
    - macOS: prefer `scripts/restart_hooyodex_service.sh restart`.
    - Linux: prefer `scripts/restart-systemd-service.sh`.
+   - If a restart lock already exists, use it to compare the current PID against the pre-restart PID before deciding whether another restart is needed.
 4. Re-read service state and confirm the PID changed.
 5. Verify `healthz` and `readyz`.
-6. If health fails:
+6. Clear `.hooyodex-service-restart.lock` after you have consumed its PID evidence and confirmed the post-restart state you needed.
+7. If health fails:
    - inspect logs,
    - inspect the installed plist or unit,
    - compare against the sanitized templates,
