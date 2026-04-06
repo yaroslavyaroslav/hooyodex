@@ -20,7 +20,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>RUST_LOG</key>
-    <string>hooyodex=info</string>
+    <string>hooyodex=info,codex_app_server=info,codex_app_server_sdk=info</string>
     <key>PATH</key>
     <string>__SERVICE_PATH__</string>
   </dict>

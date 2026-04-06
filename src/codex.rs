@@ -858,6 +858,19 @@ impl SessionManager {
                     }
                     LiveTurnEvent::Server(ServerEvent::TransportClosed)
                     | LiveTurnEvent::TransportClosed => {
+                        warn!(
+                            session_key = %key,
+                            thread_id = %thread_id,
+                            turn_id = active_turn_id.as_deref().unwrap_or("<unknown>"),
+                            app_server_connect_url = %runtime._server.connect_url(),
+                            app_server_listen_url = %runtime._server.listen_url(),
+                            app_server_log_path = %runtime
+                                ._server
+                                .log_path()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "<unavailable>".to_string()),
+                            "Codex event stream closed"
+                        );
                         return Err(anyhow!("Codex event stream closed"));
                     }
                 }

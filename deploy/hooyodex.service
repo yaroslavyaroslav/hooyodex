@@ -8,7 +8,8 @@ Type=simple
 ExecStart=__BIN__ --config %h/.config/hooyodex/config.toml run
 WorkingDirectory=%h/.config/hooyodex
 Environment=HOOYODEX_CONFIG=%h/.config/hooyodex/config.toml
-Environment=RUST_LOG=info
+Environment=RUST_LOG=hooyodex=info,codex_app_server=info,codex_app_server_sdk=info
+Environment=PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 Restart=on-failure
 RestartSec=5
 ExecReload=/bin/kill -HUP $MAINPID

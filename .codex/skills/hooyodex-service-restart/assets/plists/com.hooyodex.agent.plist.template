@@ -26,7 +26,7 @@
     <key>PATH</key>
     <string>__SERVICE_PATH__</string>
     <key>RUST_LOG</key>
-    <string>info</string>
+    <string>hooyodex=info,codex_app_server=info,codex_app_server_sdk=info</string>
   </dict>
   <key>StandardOutPath</key>
   <string>__STDOUT_PATH__</string>

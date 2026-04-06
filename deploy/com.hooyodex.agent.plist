@@ -28,7 +28,7 @@
     <key>HOOYODEX_CONFIG</key>
     <string>__CONFIG_DIR__/config.toml</string>
     <key>RUST_LOG</key>
-    <string>hooyodex=info</string>
+    <string>hooyodex=info,codex_app_server=info,codex_app_server_sdk=info</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>

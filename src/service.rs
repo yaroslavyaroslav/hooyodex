@@ -10,6 +10,7 @@ use crate::{ServiceCommand, config::AppPaths};
 const LINUX_SERVICE_NAME: &str = "hooyodex.service";
 const MAC_LABEL: &str = "com.hooyodex.agent";
 const MAC_ALT_LABEL: &str = "dev.hooyodex.agent";
+const SERVICE_RUST_LOG: &str = "hooyodex=info,codex_app_server=info,codex_app_server_sdk=info";
 
 pub fn handle(command: ServiceCommand, paths: &AppPaths) -> Result<()> {
     match command {
@@ -173,9 +174,10 @@ fn print_units(paths: &AppPaths) -> Result<()> {
 
 fn render_linux_unit(exe: &Path, config: &Path) -> String {
     format!(
-        "[Unit]\nDescription=Hooyodex Telegram Gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} --config {} run\nExecReload=/bin/kill -HUP $MAINPID\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=20\nEnvironment=RUST_LOG=hooyodex=info\nEnvironment=PATH={}\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Hooyodex Telegram Gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} --config {} run\nExecReload=/bin/kill -HUP $MAINPID\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=20\nEnvironment=RUST_LOG={}\nEnvironment=PATH={}\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
         shell_escape(exe),
         shell_escape(config),
+        SERVICE_RUST_LOG,
         service_path_env(),
         shell_escape(
             &env::var_os("HOME")
@@ -187,7 +189,7 @@ fn render_linux_unit(exe: &Path, config: &Path) -> String {
 
 fn render_macos_plist(exe: &Path, config: &Path) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>--config</string>\n    <string>{}</string>\n    <string>run</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n  <key>WorkingDirectory</key>\n  <string>{}</string>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>RUST_LOG</key>\n    <string>hooyodex=info</string>\n    <key>PATH</key>\n    <string>{}</string>\n  </dict>\n  <key>StandardOutPath</key>\n  <string>{}</string>\n  <key>StandardErrorPath</key>\n  <string>{}</string>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>--config</string>\n    <string>{}</string>\n    <string>run</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n  <key>WorkingDirectory</key>\n  <string>{}</string>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>RUST_LOG</key>\n    <string>{}</string>\n    <key>PATH</key>\n    <string>{}</string>\n  </dict>\n  <key>StandardOutPath</key>\n  <string>{}</string>\n  <key>StandardErrorPath</key>\n  <string>{}</string>\n</dict>\n</plist>\n",
         MAC_LABEL,
         xml_escape(exe),
         xml_escape(config),
@@ -196,6 +198,7 @@ fn render_macos_plist(exe: &Path, config: &Path) -> String {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
         ),
+        SERVICE_RUST_LOG,
         service_path_env(),
         xml_escape(&default_log_dir().join("hooyodex.out.log")),
         xml_escape(&default_log_dir().join("hooyodex.err.log")),
